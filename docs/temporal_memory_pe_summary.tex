@@ -1,0 +1,176 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{enumitem}
+
+\title{Temporal Memory and 3D Positional Encoding Summary}
+\author{StreamPETR Temporal Memory Notes}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Goal}
+
+The temporal memory module should cache and update dense image features between keyframes without mixing them with stale 3D positional encoding (PE). The preferred design is to cache appearance features before detector-specific 3D geometry is applied:
+
+\[
+A_t = \text{BackboneNeck}(I_t),
+\qquad
+PE_t = \text{CurrentGeometryPE}(t),
+\qquad
+D_t = \text{DetectorInput}(A_t, PE_t).
+\]
+
+On a non-keyframe, the updater should approximate the current appearance feature:
+
+\[
+\hat{A}_t = \text{MemoryUpdater}(A_{t-1}, Z_t, \Delta T_t),
+\]
+
+then the detector should use current-timestep geometry:
+
+\[
+D_t = \text{DetectorInput}(\hat{A}_t, PE_t).
+\]
+
+The main mode should therefore be:
+
+\[
+\texttt{pe\_mode = separate\_recompute}.
+\]
+
+\section{Ego-Motion Convention}
+
+Let \(T^{global}_{ego,t}\) be the ego pose at timestep \(t\). A point represented in previous ego coordinates can be transformed into current ego coordinates with:
+
+\[
+T^{ego_t}_{ego_{t-1}}
+= \left(T^{global}_{ego,t}\right)^{-1} T^{global}_{ego,t-1}.
+\]
+
+For a homogeneous point \(p_{ego,t-1}\):
+
+\[
+p_{ego,t}
+= T^{ego_t}_{ego_{t-1}} p_{ego,t-1}.
+\]
+
+This transform is useful for conditioning the updater on ego-motion. It should not be used to transform PE-added memory as the main method, because PE and appearance are not reliably separable after addition and nonlinear layers.
+
+\section{RepDETR3D}
+
+RepDETR3D's detector feature interface is multi-scale image features passed as:
+
+\[
+\{F_l\}_{l=1}^{L}, \qquad F_l \in \mathbb{R}^{B \times N \times C \times H_l \times W_l}.
+\]
+
+For the EVA-02 configuration, the expected feature levels are produced by EVAViT plus SimpleFeaturePyramid. These features are consumed by \texttt{SparseHead.forward}.
+
+\subsection{Where Geometry Enters}
+
+RepDETR3D does not add dense PETR-style 3D PE to \texttt{img\_feats} before the detector head receives them. Geometry enters later through:
+
+\begin{itemize}[noitemsep]
+  \item query/reference-point PE via \texttt{pos2posemb3d(reference\_points)};
+  \item camera-conditioned feature alignment in \texttt{SparseHead.spatial\_alignment};
+  \item projection through current \texttt{lidar2img} inside deformable feature aggregation.
+\end{itemize}
+
+\subsection{Memory Decision}
+
+RepDETR3D dense memory should cache the pre-PE image features:
+
+\[
+M_t = \{F_l\}_{l=1}^{L}, \qquad \texttt{pre\_pe=True}.
+\]
+
+On non-keyframes, the updated memory should be injected back as \texttt{data["img\_feats"]}. The normal RepDETR3D head should then run with current-frame metadata:
+
+\[
+\hat{M}_t \rightarrow \texttt{SparseHead}(\texttt{img\_metas}_t, \texttt{lidar2img}_t, \texttt{intrinsics}_t, \texttt{extrinsics}_t).
+\]
+
+No stale dense PE is cached in the planned interface.
+
+\section{StreamPETR}
+
+StreamPETR's feature interface is a single image feature tensor:
+
+\[
+F_t \in \mathbb{R}^{B \times N \times C \times H \times W}.
+\]
+
+In the EVA-02 StreamPETR configuration, EVAViT plus SimpleFeaturePyramid emits a stride-16 feature level that is passed to \texttt{StreamPETRHead.forward}.
+
+\subsection{Where Geometry Enters}
+
+StreamPETR computes dense 3D PE inside:
+
+\[
+\texttt{StreamPETRHead.position\_embeding(...)}.
+\]
+
+The head flattens image features into memory tokens:
+
+\[
+A_t = \text{reshape}(F_t) \in \mathbb{R}^{B \times (N H W) \times C},
+\]
+
+then computes current-frame positional features:
+
+\[
+PE_t = \texttt{position\_embeding}(\texttt{lidar2img}_t, \texttt{intrinsics}_t, \texttt{img\_metas}_t).
+\]
+
+The transformer receives appearance memory and PE separately:
+
+\[
+\texttt{transformer}(A_t, \ldots, PE_t, \ldots).
+\]
+
+\subsection{Memory Decision}
+
+StreamPETR memory should be cached before \texttt{position\_embeding} and before \texttt{featurized\_pe}. The updated non-keyframe appearance memory should use current-frame PE:
+
+\[
+\hat{A}_t = \text{MemoryUpdater}(A_{t-1}, Z_t, \Delta T_t),
+\qquad
+PE_t = \text{CurrentFramePE}(t).
+\]
+
+The main method should not reuse \(PE_{t-1}\). A stale-PE mode may be useful only as an explicit debugging fallback:
+
+\[
+\texttt{pe\_mode = stale\_pe} \quad \text{(debug/ablation only)}.
+\]
+
+\section{Summary Table}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\toprule
+Detector & Cached memory & 3D PE location & Main PE mode \\
+\midrule
+RepDETR3D & multi-scale \texttt{img\_feats} & head/query/cross-attention geometry & \texttt{separate\_recompute} \\
+StreamPETR & pre-PE image tokens/features & \texttt{StreamPETRHead.position\_embeding} & \texttt{separate\_recompute} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Implementation Implications}
+
+\begin{enumerate}[noitemsep]
+  \item Cache appearance features, not PE-added features.
+  \item Mark memory packets with \texttt{pre\_pe=True}.
+  \item Recompute PE or geometry-dependent alignment from current timestep metadata.
+  \item Use ego-motion as updater conditioning first; avoid spatially warping dense image memory initially.
+  \item Keep \texttt{stale\_pe} as an explicit fallback/debug mode only if a post-PE path is unavoidable.
+  \item Verify identity ego-motion: if \(T^{global}_{ego,t} = T^{global}_{ego,t-1}\), then the relative transform must be identity.
+\end{enumerate}
+
+\end{document}
