@@ -1,0 +1,5 @@
+source_feature_set,top5_features,r2_mean,r2_std,mae_mean,mae_std
+metadata_offline_plus_L8,"similarity_L8_mean, similarity_L8_CAM_BACK, max_2d_box_area_px, min_camera_annotation_count, min_object_distance_m",0.9401502479973761,0.01183545677355692,0.017033144011767386,0.0009349275752360382
+metadata_online_plus_L8,"similarity_L8_mean, similarity_L8_CAM_BACK, similarity_L8_CAM_FRONT_RIGHT, ego_y_m, similarity_L8_CAM_FRONT_LEFT",0.8947187509453295,0.02402587139479241,0.022361754708311525,0.0011192368982850297
+metadata_offline,"delta_ego_translation_m, ego_speed_mps, abs_yaw_rate_deg_s, max_2d_box_area_px, min_camera_annotation_count",0.7971963457754415,0.019972814933022054,0.03261288696231582,0.001750178845405176
+metadata_online,"delta_ego_translation_m, ego_speed_mps, abs_yaw_rate_deg_s, ego_y_m, ego_x_m",0.6812572300367857,0.06689689194426979,0.04055107275319592,0.0027723377284997698
