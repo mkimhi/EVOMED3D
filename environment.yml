@@ -1,0 +1,33 @@
+name: evomed3d
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.8
+  - pip
+  - pytorch=1.13.1
+  - torchvision=0.14.1
+  - torchaudio=0.13.1
+  - pytorch-cuda=11.7
+  - numpy=1.23.5
+  - scipy=1.10.1
+  - pandas=2.0.3
+  - matplotlib=3.5.3
+  - scikit-learn=1.3.2
+  - ipykernel=6.29.5
+  - pip:
+      - -f https://download.openmmlab.com/mmcv/dist/cu117/torch1.13.0/index.html
+      - mmcv-full==1.7.0
+      - mmdet==2.28.2
+      - mmsegmentation==0.30.0
+      - nuscenes-devkit==1.1.11
+      - timm==0.6.13
+      - einops==0.8.1
+      - opencv-python==4.13.0.92
+      - wandb==0.24.2
+      - pytest==8.3.5
+
+# After creating the environment, install the local mmdetection3d checkout:
+#   cd mmdetection3d && git checkout v1.0.0rc6 && pip install -e .
