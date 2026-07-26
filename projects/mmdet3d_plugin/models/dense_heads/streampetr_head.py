@@ -9,6 +9,7 @@
 # ------------------------------------------------------------------------
 #  Modified by Shihao Wang
 # ------------------------------------------------------------------------
+import copy
 import torch
 import torch.nn as nn
 from mmcv.cnn import Linear, bias_init_with_prob
@@ -26,6 +27,10 @@ from projects.mmdet3d_plugin.core.bbox.util import normalize_bbox
 from mmdet.models.utils import NormedLinear
 from projects.mmdet3d_plugin.models.utils.positional_encoding import pos2posemb3d, pos2posemb1d, nerf_positional_encoding
 from projects.mmdet3d_plugin.models.utils.misc import MLN, topk_gather, transform_reference_points, memory_refresh, SELayer_Linear
+from projects.mmdet3d_plugin.models.routing import (
+    GumbelTokenRouter,
+    pack_tokens_with_ambient,
+)
 
 @HEADS.register_module()
 class StreamPETRHead(AnchorFreeHead):
@@ -103,6 +108,11 @@ class StreamPETRHead(AnchorFreeHead):
                  noise_trans = 0.0,
                  dn_weight = 1.0,
                  split = 0.5,
+                 routing_mode='off',
+                 routing_keep_ratio=1.0,
+                 routing_ambient_context_len=1,
+                 routing_log_stats=False,
+                 routing_router=None,
                  init_cfg=None,
                  normedlinear=False,
                  **kwargs):
@@ -183,6 +193,12 @@ class StreamPETRHead(AnchorFreeHead):
         self.bbox_noise_trans = noise_trans
         self.dn_weight = dn_weight
         self.split = split 
+        self.routing_mode = routing_mode
+        self.routing_keep_ratio = float(routing_keep_ratio)
+        self.routing_ambient_context_len = int(routing_ambient_context_len)
+        self.routing_log_stats = routing_log_stats
+        self.routing_router_cfg = copy.deepcopy(routing_router)
+        self.latest_routing_metadata = None
 
         self.act_cfg = transformer.get('act_cfg',
                                        dict(type='ReLU', inplace=True))
@@ -208,6 +224,7 @@ class StreamPETRHead(AnchorFreeHead):
             self.match_costs), requires_grad=False)
 
         self.bbox_coder = build_bbox_coder(bbox_coder)
+        self.routing_router = self._build_routing_router(self.routing_router_cfg)
 
         self.pc_range = nn.Parameter(torch.tensor(
             self.bbox_coder.pc_range), requires_grad=False)
@@ -229,6 +246,52 @@ class StreamPETRHead(AnchorFreeHead):
 
         self._init_layers()
         self.reset_memory()
+
+    def _build_routing_router(self, routing_router):
+        if self.routing_mode in (None, 'off'):
+            return None
+        if self.routing_mode != 'learned_gumbel_ambient':
+            raise ValueError(
+                "StreamPETRHead routing_mode currently supports only 'off' "
+                f"or 'learned_gumbel_ambient', got {self.routing_mode}"
+            )
+        if routing_router is None:
+            return GumbelTokenRouter(
+                embed_dims=self.embed_dims,
+                keep_ratio=self.routing_keep_ratio,
+            )
+
+        routing_router = copy.deepcopy(routing_router)
+        router_type = routing_router.pop('type', 'GumbelTokenRouter')
+        if router_type != 'GumbelTokenRouter':
+            raise ValueError(f'Unsupported routing router type: {router_type}')
+        routing_router.setdefault('embed_dims', self.embed_dims)
+        routing_router.setdefault('keep_ratio', self.routing_keep_ratio)
+        return GumbelTokenRouter(**routing_router)
+
+    def _apply_token_routing(self, memory, pos_embed):
+        if self.routing_mode in (None, 'off'):
+            self.latest_routing_metadata = None
+            return memory, pos_embed
+
+        keep_mask, metadata = self.routing_router.select_mask(memory)
+        memory, pos_embed, pack_metadata = pack_tokens_with_ambient(
+            memory,
+            pos_embed,
+            keep_mask,
+            ambient_context_len=self.routing_ambient_context_len,
+        )
+        metadata.update(pack_metadata)
+        self.latest_routing_metadata = metadata
+        if self.routing_log_stats:
+            print(
+                "stream_petr_routing_metadata: "
+                f"mode={metadata['routing_mode']} "
+                f"tokens={metadata['routing_num_tokens_before']}->"
+                f"{metadata['routing_num_tokens_after']} "
+                f"keep={metadata['routing_keep_count']}"
+            )
+        return memory, pos_embed
 
     def _init_layers(self):
         """Initialize layers of the transformer head."""
@@ -593,6 +656,7 @@ class StreamPETRHead(AnchorFreeHead):
         # spatial_alignment in focal petr
         memory = self.spatial_alignment(memory, cone)
         pos_embed = self.featurized_pe(pos_embed, memory)
+        memory, pos_embed = self._apply_token_routing(memory, pos_embed)
 
         reference_points = self.reference_points.weight
         reference_points, attn_mask, mask_dict = self.prepare_for_dn(B, reference_points, img_metas)

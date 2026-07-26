@@ -43,7 +43,12 @@ class Petr3D(MVXTwoStageDetector):
                  position_level=0,
                  aux_2d_only=True,
                  single_test=False,
-                 pretrained=None):
+                 pretrained=None,
+                 temporal_memory=None,
+                 tm_debug_shapes=False,
+                 tm_debug_latency=False,
+                 tm_debug_compare_full_path=False,
+                 tm_assert_no_teacher_in_inference=True):
         super(Petr3D, self).__init__(pts_voxel_layer, pts_voxel_encoder,
                              pts_middle_encoder, pts_fusion_layer,
                              img_backbone, pts_backbone, img_neck, pts_neck,
@@ -60,6 +65,18 @@ class Petr3D(MVXTwoStageDetector):
         self.position_level = position_level
         self.aux_2d_only = aux_2d_only
         self.test_flag = False
+        self.temporal_memory = temporal_memory or {}
+        self.temporal_memory_enabled = bool(self.temporal_memory.get('enabled', False))
+        self.tm_debug_shapes = tm_debug_shapes
+        self.tm_debug_latency = tm_debug_latency
+        self.tm_debug_compare_full_path = tm_debug_compare_full_path
+        self.tm_assert_no_teacher_in_inference = tm_assert_no_teacher_in_inference
+        self.temporal_memory_adapter = None
+
+    def _maybe_log_tm_shapes(self, img_feats):
+        if not (self.temporal_memory_enabled and self.tm_debug_shapes):
+            return
+        print(f'[temporal_memory] Petr3D img_feats shape: {tuple(img_feats.shape)}')
 
 
     def extract_img_feat(self, img, len_queue=1, training_mode=False):
@@ -92,6 +109,7 @@ class Petr3D(MVXTwoStageDetector):
             img_feats_reshaped = img_feats[self.position_level].view(B, int(BN/B/len_queue), C, H, W)
 
 
+        self._maybe_log_tm_shapes(img_feats_reshaped)
         return img_feats_reshaped
 
 

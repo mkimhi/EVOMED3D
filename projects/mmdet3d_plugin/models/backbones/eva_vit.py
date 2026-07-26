@@ -997,23 +997,52 @@ class EVAViT(nn.Module):
             for m in self.parameters():
                 m.requires_grad = False
             
-    def forward(self, x, img_metas=None):
+    def _forward_blocks(self, x, stop_at=None):
         x = self.patch_embed(x)
         if self.pos_embed is not None:
             x = x + get_abs_pos(
                 self.pos_embed, self.pretrain_use_cls_token, (x.shape[1], x.shape[2])
             )
 
-        for blk in self.blocks:
+        for index, blk in enumerate(self.blocks):
             x = blk(x)   # b, h, w, c
-        x = x.permute(0, 3, 1, 2) # b, c, h, w 
+            if stop_at is not None and index == stop_at:
+                return x
+        return x
 
+    def forward_intermediate(self, x, layer_index):
+        if layer_index < 0 or layer_index >= len(self.blocks):
+            raise ValueError(f'layer_index must be in [0, {len(self.blocks) - 1}], got {layer_index}')
+        x = self._forward_blocks(x, stop_at=layer_index)
+        x = x.permute(0, 3, 1, 2) # b, c, h, w 
+        return x
+
+    def forward(self, x, img_metas=None):
+        x = self._forward_blocks(x)
+        x = x.permute(0, 3, 1, 2) # b, c, h, w 
         if self.adapter is not None:
             outputs = self.adapter(x)
         else:
             outputs = [x, ]
 
         return outputs
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict,
+        missing_keys, unexpected_keys, error_msgs):
+        if self.adapter is not None:
+            legacy_prefix = 'backbone.simfp_'
+            target_prefix = prefix + 'adapter.simfp_'
+            for key in list(state_dict.keys()):
+                if key.startswith(legacy_prefix):
+                    target_key = target_prefix + key[len(legacy_prefix):]
+                    if target_key not in state_dict:
+                        state_dict[target_key] = state_dict[key]
+                    state_dict.pop(key)
+
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs)
 
 
 class SimpleFeaturePyramid(nn.Module):

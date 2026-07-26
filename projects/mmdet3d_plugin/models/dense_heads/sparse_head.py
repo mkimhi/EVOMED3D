@@ -13,6 +13,11 @@ from mmdet3d.core.bbox.coders import build_bbox_coder
 from projects.mmdet3d_plugin.core.bbox.util import normalize_bbox
 from projects.mmdet3d_plugin.models.utils.positional_encoding import pos2posemb3d, pos2posemb1d, nerf_positional_encoding
 from projects.mmdet3d_plugin.models.utils.misc import MLN, topk_gather, transform_reference_points, memory_refresh, SELayer_Linear
+from projects.mmdet3d_plugin.models.routing import (
+    GumbelTokenRouter,
+    apply_dense_budget_mask,
+    make_budget_mask,
+)
 import copy
 from mmdet.models.utils import NormedLinear
 
@@ -87,6 +92,15 @@ class SparseHead(AnchorFreeHead):
                  noise_trans = 0.0,
                  dn_weight = 1.0,
                  split = 0.5,
+                 routing_mode='off',
+                 routing_keep_ratio=1.0,
+                 routing_keep_ratio_stopped=None,
+                 routing_keep_ratio_moderate=None,
+                 routing_keep_ratio_fast=None,
+                 routing_stopped_speed=0.5,
+                 routing_high_speed=12.0,
+                 routing_log_stats=False,
+                 routing_router=None,
                  init_cfg=None,
                  normedlinear=False,
                  **kwargs):
@@ -163,6 +177,16 @@ class SparseHead(AnchorFreeHead):
         self.bbox_noise_trans = noise_trans
         self.dn_weight = dn_weight
         self.split = split 
+        self.routing_mode = routing_mode
+        self.routing_keep_ratio = float(routing_keep_ratio)
+        self.routing_keep_ratio_stopped = routing_keep_ratio_stopped
+        self.routing_keep_ratio_moderate = routing_keep_ratio_moderate
+        self.routing_keep_ratio_fast = routing_keep_ratio_fast
+        self.routing_stopped_speed = float(routing_stopped_speed)
+        self.routing_high_speed = float(routing_high_speed)
+        self.routing_log_stats = routing_log_stats
+        self.routing_router_cfg = copy.deepcopy(routing_router)
+        self.latest_routing_metadata = None
 
         self.act_cfg = transformer.get('act_cfg',
                                        dict(type='ReLU', inplace=True))
@@ -188,6 +212,7 @@ class SparseHead(AnchorFreeHead):
             self.match_costs), requires_grad=False)
 
         self.bbox_coder = build_bbox_coder(bbox_coder)
+        self.routing_router = self._build_routing_router(self.routing_router_cfg)
 
         self.pc_range = nn.Parameter(torch.tensor(
             self.bbox_coder.pc_range), requires_grad=False)
@@ -195,6 +220,70 @@ class SparseHead(AnchorFreeHead):
 
         self._init_layers()
         self.reset_memory()
+
+    def _build_routing_router(self, routing_router):
+        if routing_router is None:
+            if self.routing_mode == 'learned_gumbel_ambient':
+                return GumbelTokenRouter(
+                    embed_dims=self.embed_dims,
+                    keep_ratio=self.routing_keep_ratio,
+                )
+            return None
+
+        routing_router = copy.deepcopy(routing_router)
+        router_type = routing_router.pop('type', 'GumbelTokenRouter')
+        if router_type != 'GumbelTokenRouter':
+            raise ValueError(f'Unsupported routing router type: {router_type}')
+        routing_router.setdefault('embed_dims', self.embed_dims)
+        routing_router.setdefault('keep_ratio', self.routing_keep_ratio)
+        return GumbelTokenRouter(**routing_router)
+
+    def _apply_token_routing(self, feat_flatten, data):
+        if self.routing_mode in (None, 'off'):
+            self.latest_routing_metadata = None
+            return feat_flatten
+
+        if self.routing_mode not in {
+            'zero', 'hard_drop', 'ambient_pool', 'learned_gumbel_ambient'
+        }:
+            raise ValueError(
+                "routing_mode must be 'off', 'zero', 'hard_drop', or "
+                f"'ambient_pool', or 'learned_gumbel_ambient', got "
+                f"{self.routing_mode}"
+            )
+
+        scores = feat_flatten.detach().float().norm(dim=-1)
+        keep_mask, target_ratio = make_budget_mask(
+            scores,
+            self.routing_keep_ratio,
+            ego_speed=data.get('ego_speed', None),
+            stopped_keep_ratio=self.routing_keep_ratio_stopped,
+            moderate_keep_ratio=self.routing_keep_ratio_moderate,
+            fast_keep_ratio=self.routing_keep_ratio_fast,
+            stopped_speed=self.routing_stopped_speed,
+            high_speed=self.routing_high_speed,
+        )
+        if self.routing_mode == 'learned_gumbel_ambient':
+            routed, metadata = self.routing_router(feat_flatten, keep_ratio=target_ratio)
+        else:
+            routed, metadata = apply_dense_budget_mask(
+                feat_flatten,
+                keep_mask,
+                mode=self.routing_mode,
+            )
+            metadata.update(
+                routing_target_keep_ratio=target_ratio.detach().cpu().tolist(),
+                routing_preserves_dense_geometry=True,
+            )
+        self.latest_routing_metadata = metadata
+        if self.routing_log_stats:
+            print(
+                "routing_metadata: "
+                f"mode={metadata['routing_mode']} "
+                f"keep={metadata['routing_keep_count']}/"
+                f"{metadata['routing_num_tokens']}"
+            )
+        return routed
 
     def _init_layers(self):
         """Initialize layers of the transformer head."""
@@ -471,6 +560,7 @@ class SparseHead(AnchorFreeHead):
             feat_flatten.append(mlvl_feat.to(dtype))
             spatial_flatten.append((H, W))
         feat_flatten = torch.cat(feat_flatten, dim=1)
+        feat_flatten = self._apply_token_routing(feat_flatten, data)
         spatial_flatten = torch.as_tensor(spatial_flatten, dtype=torch.long, device=mlvl_feats[0].device)
         level_start_index = torch.cat((spatial_flatten.new_zeros((1, )), spatial_flatten.prod(1).cumsum(0)[:-1]))
         reference_points, attn_mask, mask_dict = self.prepare_for_dn(B, reference_points, img_metas)

@@ -6,23 +6,28 @@
 import argparse
 import mmcv
 import os
+import sys
 import torch
 import warnings
+import time
+import os.path as osp
+
+sys.path.insert(0, osp.abspath(osp.join(osp.dirname(__file__), '..')))
+
 from mmcv import Config, DictAction
 from mmcv.cnn import fuse_conv_bn
 from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
 from mmcv.runner import (get_dist_info, init_dist, load_checkpoint,
                          wrap_fp16_model)
 
-from mmdet3d.apis import single_gpu_test
 from mmdet3d.datasets import build_dataset
 from projects.mmdet3d_plugin.datasets.builder import build_dataloader
 from mmdet3d.models import build_model
 from mmdet.apis import set_random_seed
-from projects.mmdet3d_plugin.core.apis.test import custom_multi_gpu_test
+from projects.mmdet3d_plugin.core.apis.test import (
+    custom_multi_gpu_test, custom_single_gpu_test)
 from mmdet.datasets import replace_ImageToTensor
-import time
-import os.path as osp
+from tools.eval_utils import limit_dataset
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -92,6 +97,16 @@ def parse_args():
         default='none',
         help='job launcher')
     parser.add_argument('--local_rank', type=int, default=0)
+    parser.add_argument(
+        '--num_test',
+        type=int,
+        default=None,
+        help='only evaluate the first N test instances')
+    parser.add_argument(
+        '--timing-warmup',
+        type=int,
+        default=5,
+        help='number of warmup samples to skip in timing summaries')
     args = parser.parse_args()
     if 'LOCAL_RANK' not in os.environ:
         os.environ['LOCAL_RANK'] = str(args.local_rank)
@@ -189,6 +204,7 @@ def main():
 
     # build the dataloader
     dataset = build_dataset(cfg.data.test)
+    dataset = limit_dataset(dataset, args.num_test)
     data_loader = build_dataloader(
         dataset,
         samples_per_gpu=samples_per_gpu,
@@ -221,16 +237,21 @@ def main():
         model.PALETTE = dataset.PALETTE
 
     if not distributed:
-        assert False
-        # model = MMDataParallel(model, device_ids=[0])
-        # outputs = single_gpu_test(model, data_loader, args.show, args.show_dir)
+        model = MMDataParallel(model, device_ids=[0])
+        outputs = custom_single_gpu_test(
+            model,
+            data_loader,
+            args.show,
+            args.show_dir,
+            timing_warmup=args.timing_warmup)
     else:
         model = MMDistributedDataParallel(
             model.cuda(),
             device_ids=[torch.cuda.current_device()],
             broadcast_buffers=False)
         outputs = custom_multi_gpu_test(model, data_loader, args.tmpdir,
-                                        args.gpu_collect)
+                                        args.gpu_collect,
+                                        timing_warmup=args.timing_warmup)
 
     rank, _ = get_dist_info()
     if rank == 0:
