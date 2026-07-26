@@ -19,6 +19,10 @@ from nuscenes.eval.common.utils import Quaternion
 from mmcv.parallel import DataContainer as DC
 import random
 import math
+import os
+import os.path as osp
+import mmcv
+
 @DATASETS.register_module()
 class CustomNuScenesDataset(NuScenesDataset):
     r"""NuScenes Dataset.
@@ -145,6 +149,25 @@ class CustomNuScenesDataset(NuScenesDataset):
         queue = queue[-1]
         return queue
 
+
+    def _get_ego_speed(self, index):
+        """Compute frame speed from consecutive ego poses in the same scene."""
+        if index <= 0:
+            return 0.0
+
+        info = self.data_infos[index]
+        prev_info = self.data_infos[index - 1]
+        if info.get('scene_token') != prev_info.get('scene_token'):
+            return 0.0
+
+        dt = (info['timestamp'] - prev_info['timestamp']) / 1e6
+        if dt <= 0:
+            return 0.0
+
+        cur_xy = np.array(info['ego2global_translation'][:2], dtype=np.float64)
+        prev_xy = np.array(prev_info['ego2global_translation'][:2], dtype=np.float64)
+        return float(np.linalg.norm(cur_xy - prev_xy) / dt)
+
     def get_data_info(self, index):
         """Get data info according to the given index.
 
@@ -187,6 +210,7 @@ class CustomNuScenesDataset(NuScenesDataset):
             scene_token=info['scene_token'],
             frame_idx=info['frame_idx'],
             timestamp=info['timestamp'] / 1e6,
+            ego_speed=self._get_ego_speed(index),
         )
 
         if self.modality['use_camera']:
@@ -240,6 +264,118 @@ class CustomNuScenesDataset(NuScenesDataset):
             
         return input_dict
 
+    def _evaluate_single(self,
+                         result_path,
+                         logger=None,
+                         metric='bbox',
+                         result_name='pts_bbox'):
+        eval_sample_tokens = getattr(self, '_eval_sample_tokens', None)
+        if eval_sample_tokens is None:
+            return super()._evaluate_single(
+                result_path, logger=logger, metric=metric,
+                result_name=result_name)
+
+        from nuscenes import NuScenes
+        from nuscenes.eval.common.loaders import (
+            add_center_dist, filter_eval_boxes, load_gt, load_prediction)
+        from nuscenes.eval.detection.data_classes import DetectionBox
+        from nuscenes.eval.detection.evaluate import NuScenesEval
+
+        class NuScenesSubsetEval(NuScenesEval):
+            def __init__(self, nusc, config, result_path, eval_set,
+                         output_dir=None, verbose=True):
+                self.nusc = nusc
+                self.result_path = result_path
+                self.eval_set = eval_set
+                self.output_dir = output_dir
+                self.verbose = verbose
+                self.cfg = config
+
+                assert os.path.exists(result_path), (
+                    'Error: The result file does not exist!')
+                self.plot_dir = os.path.join(self.output_dir, 'plots')
+                mmcv.mkdir_or_exist(self.output_dir)
+                mmcv.mkdir_or_exist(self.plot_dir)
+
+                if verbose:
+                    print('Initializing nuScenes detection evaluation')
+                self.pred_boxes, self.meta = load_prediction(
+                    self.result_path, self.cfg.max_boxes_per_sample,
+                    DetectionBox, verbose=verbose)
+                self.gt_boxes = load_gt(
+                    self.nusc, self.eval_set, DetectionBox, verbose=verbose)
+
+                pred_tokens = set(self.pred_boxes.sample_tokens)
+                expected_tokens = set(eval_sample_tokens)
+                if pred_tokens != expected_tokens:
+                    print(
+                        'Warning: subset prediction tokens differ from '
+                        '--num_test tokens; evaluating prediction tokens.')
+
+                filtered_gt = type(self.gt_boxes.boxes)(list)
+                for sample_token in self.pred_boxes.sample_tokens:
+                    filtered_gt[sample_token] = self.gt_boxes.boxes[
+                        sample_token]
+                self.gt_boxes.boxes = filtered_gt
+
+                assert set(self.pred_boxes.sample_tokens) == set(
+                    self.gt_boxes.sample_tokens), (
+                        "Samples in split doesn't match samples in "
+                        'predictions.')
+
+                self.pred_boxes = add_center_dist(nusc, self.pred_boxes)
+                self.gt_boxes = add_center_dist(nusc, self.gt_boxes)
+
+                if verbose:
+                    print('Filtering predictions')
+                self.pred_boxes = filter_eval_boxes(
+                    nusc, self.pred_boxes, self.cfg.class_range,
+                    verbose=verbose)
+                if verbose:
+                    print('Filtering ground truth annotations')
+                self.gt_boxes = filter_eval_boxes(
+                    nusc, self.gt_boxes, self.cfg.class_range,
+                    verbose=verbose)
+
+                self.sample_tokens = self.gt_boxes.sample_tokens
+
+        output_dir = osp.join(*osp.split(result_path)[:-1])
+        nusc = NuScenes(
+            version=self.version,
+            dataroot=self._get_eval_data_root(self.version),
+            verbose=False)
+        eval_set_map = {
+            'v1.0-mini': 'mini_val',
+            'v1.0-trainval': 'val',
+        }
+        nusc_eval = NuScenesSubsetEval(
+            nusc,
+            config=self.eval_detection_configs,
+            result_path=result_path,
+            eval_set=eval_set_map[self.version],
+            output_dir=output_dir,
+            verbose=True)
+        nusc_eval.main(render_curves=False)
+
+        metrics = mmcv.load(osp.join(output_dir, 'metrics_summary.json'))
+        detail = dict()
+        metric_prefix = f'{result_name}_NuScenes'
+        for name in self.CLASSES:
+            for k, v in metrics['label_aps'][name].items():
+                val = float('{:.4f}'.format(v))
+                detail['{}/{}_AP_dist_{}'.format(
+                    metric_prefix, name, k)] = val
+            for k, v in metrics['label_tp_errors'][name].items():
+                val = float('{:.4f}'.format(v))
+                detail['{}/{}_{}'.format(metric_prefix, name, k)] = val
+            for k, v in metrics['tp_errors'].items():
+                val = float('{:.4f}'.format(v))
+                detail['{}/{}'.format(
+                    metric_prefix, self.ErrNameMapping[k])] = val
+
+        detail['{}/NDS'.format(metric_prefix)] = metrics['nd_score']
+        detail['{}/mAP'.format(metric_prefix)] = metrics['mean_ap']
+        return detail
 
     def __getitem__(self, idx):
         """Get item from infos according to the given index.

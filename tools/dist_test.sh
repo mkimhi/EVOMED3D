@@ -8,6 +8,11 @@ NODE_RANK=${NODE_RANK:-0}
 PORT=${PORT:-29500}
 MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 
+if [[ -z "${NCCL_NET:-}" || "${NCCL_NET}" == "gIB" ]]; then
+    export NCCL_NET=Socket
+fi
+export NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-1}
+
 PYTHONPATH="$(dirname $0)/..":$PYTHONPATH \
 python -m torch.distributed.launch \
     --nnodes=$NNODES \

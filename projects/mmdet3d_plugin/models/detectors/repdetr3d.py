@@ -9,7 +9,13 @@
 # ------------------------------------------------------------------------
 #  Modified by Shihao Wang
 # ------------------------------------------------------------------------
+from contextlib import nullcontext as _nullcontext
+import csv
+import inspect
+import math
+
 import torch
+import torch.nn.functional as F
 from mmcv.runner import force_fp32, auto_fp16
 from mmdet.models import DETECTORS
 from mmdet3d.core import bbox3d2result
@@ -43,7 +49,12 @@ class RepDetr3D(MVXTwoStageDetector):
                  position_level=[0],
                  aux_2d_only=True,
                  single_test=False,
-                 pretrained=None):
+                 pretrained=None,
+                 temporal_memory=None,
+                 tm_debug_shapes=False,
+                 tm_debug_latency=False,
+                 tm_debug_compare_full_path=False,
+                 tm_assert_no_teacher_in_inference=True):
         super(RepDetr3D, self).__init__(pts_voxel_layer, pts_voxel_encoder,
                              pts_middle_encoder, pts_fusion_layer,
                              img_backbone, pts_backbone, img_neck, pts_neck,
@@ -60,6 +71,883 @@ class RepDetr3D(MVXTwoStageDetector):
         self.position_level = position_level
         self.aux_2d_only = aux_2d_only
         self.test_flag = False
+        self.temporal_memory = temporal_memory or {}
+        self.temporal_memory_enabled = bool(self.temporal_memory.get('enabled', False))
+        self.tm_debug_shapes = tm_debug_shapes
+        self.tm_debug_latency = tm_debug_latency
+        self.tm_debug_compare_full_path = tm_debug_compare_full_path
+        self.tm_assert_no_teacher_in_inference = tm_assert_no_teacher_in_inference
+        self.temporal_memory_adapter = None
+        self.temporal_memory_controller = None
+        self.temporal_memory_projector = None
+        self.temporal_memory_updater = None
+        self.temporal_memory_policy = None
+        self._tm_train_step = 0
+        self._tm_previous_full_teacher = None
+        self._tm_policy_prev_state = None
+        self._tm_policy_prev_l8_features = None
+        self._tm_policy_previous_l8_similarity = None
+        self._tm_policy_prev_l12_features = None
+        self._tm_policy_previous_l12_similarity = None
+        self._tm_policy_prev_prediction_features = None
+        self._tm_policy_offline_lookup = self._load_tm_policy_offline_lookup(
+            self.temporal_memory.get('policy_offline_csv', None))
+        self.tm_profiler = None
+        if self.tm_debug_latency:
+            from projects.mmdet3d_plugin.models.temporal_memory import TemporalMemoryProfiler
+            self.tm_profiler = TemporalMemoryProfiler(enabled=True)
+        if self.temporal_memory_enabled:
+            from projects.mmdet3d_plugin.models.temporal_memory import (
+                LayeredPartialFeatureProjector,
+                PartialFeatureProjector,
+                TemporalMemoryController,
+                build_detector_adapter,
+            )
+            updater_cfg = dict(self.temporal_memory.get('updater_cfg', {}) or {})
+            if 'shared_memory_gate' in self.temporal_memory:
+                updater_cfg.setdefault(
+                    'shared_memory_gate',
+                    self.temporal_memory.get('shared_memory_gate'))
+            if 'partial_layers' in self.temporal_memory:
+                updater_cfg.setdefault('layers', self.temporal_memory.get('partial_layers'))
+            self.temporal_memory_adapter = build_detector_adapter(
+                self.temporal_memory.get('detector_adapter', 'repdetr3d'),
+                debug_shapes=tm_debug_shapes)
+            self.temporal_memory_controller = TemporalMemoryController(
+                enabled=True,
+                keyframe_interval=self.temporal_memory.get('keyframe_interval', 1),
+                updater=self.temporal_memory.get('updater', 'reuse'),
+                updater_cfg=updater_cfg,
+                policy=self.temporal_memory.get('policy', None),
+                partial_layer=self.temporal_memory.get('partial_layer', 'block8'),
+                train_with_teacher=self.temporal_memory.get('train_with_teacher', False),
+                distill_weight=self.temporal_memory.get('distill_weight', 1.0),
+                inference_teacher_forbidden=self.temporal_memory.get(
+                    'inference_teacher_forbidden',
+                    tm_assert_no_teacher_in_inference),
+                max_frames_between_full=self.temporal_memory.get(
+                    'max_frames_between_full', None),
+                profiler=self.tm_profiler,
+                debug=tm_debug_shapes)
+            if isinstance(self.temporal_memory_controller.updater, torch.nn.Module):
+                self.temporal_memory_updater = self.temporal_memory_controller.updater
+            if isinstance(self.temporal_memory_controller.policy, torch.nn.Module):
+                self.temporal_memory_policy = self.temporal_memory_controller.policy
+            if self.temporal_memory.get('updater', 'reuse') != 'reuse':
+                projector_cfg = dict(self.temporal_memory.get('projector_cfg', {}))
+                if self.temporal_memory.get('projectors_per_layer', True):
+                    self.temporal_memory_projector = LayeredPartialFeatureProjector(
+                        layers=self.temporal_memory.get('partial_layers', (8, 12, 16)),
+                        projector_cfg=projector_cfg,
+                        per_layer_cfg=self.temporal_memory.get('projector_per_layer_cfg', None),
+                    )
+                else:
+                    self.temporal_memory_projector = PartialFeatureProjector(**projector_cfg)
+            if self.temporal_memory.get('freeze_pretrained_detector', False):
+                self._freeze_temporal_memory_pretrained_detector()
+
+    def _maybe_log_tm_shapes(self, img_feats):
+        if not (self.temporal_memory_enabled and self.tm_debug_shapes):
+            return
+        shapes = [tuple(feat.shape) for feat in img_feats]
+        print(f'[temporal_memory] RepDetr3D img_feats shapes: {shapes}')
+
+    def _extract_img_feat_temporal_memory(self, img_metas, **data):
+        if (
+            not self.temporal_memory_enabled
+            or self.training
+        ):
+            if self.tm_profiler is None:
+                return self.extract_img_feat(data['img'], 1)
+            with self.tm_profiler.measure('backbone_full'):
+                return self.extract_img_feat(data['img'], 1)
+
+        scene_token = img_metas[0].get('scene_token') if img_metas else None
+        prev_exists = data.get('prev_exists', None)
+        if prev_exists is not None and hasattr(prev_exists, 'numel') and prev_exists.numel() == 1:
+            prev_exists = bool(prev_exists.item())
+
+        partial_current = None
+        l8_features = None
+        l12_features = None
+        policy_features = self._temporal_memory_policy_features(
+            img_metas, data, scene_token=scene_token)
+        action = self._temporal_memory_next_action(
+            scene_token=scene_token,
+            prev_exists=prev_exists,
+            policy_features=policy_features)
+        if (
+            self._temporal_memory_policy_needs_l8_probe()
+            and getattr(self.temporal_memory_controller, 'memory', None) is not None
+        ):
+            l8_features = self._profile_extract_partial_features(data, 'block8')
+            policy_features.update(self._temporal_memory_l8_similarity_features(
+                getattr(self, '_tm_policy_prev_l8_features', None), l8_features))
+            action = self._temporal_memory_next_action(
+                scene_token=scene_token,
+                prev_exists=prev_exists,
+                policy_features=policy_features)
+        if (
+            self.temporal_memory.get('updater', 'reuse') != 'reuse'
+            and action != 'L24'
+        ):
+            layer_id = self._temporal_memory_action_layer(action)
+            partial_features = l8_features if layer_id == 'block8' and l8_features is not None else self._profile_extract_partial_features(
+                data,
+                layer_id)
+            if layer_id == 'block8':
+                l8_features = partial_features
+            elif layer_id == 'block12':
+                l12_features = partial_features
+            partial_current = self._project_temporal_memory_partial(
+                partial_features,
+                layer_id=layer_id,
+                action=action)
+        if self._temporal_memory_policy_needs_previous_l8_drift() and l8_features is None:
+            l8_features = self._profile_extract_partial_features(data, 'block8')
+        if self._temporal_memory_policy_needs_previous_l12_drift() and l12_features is None:
+            l12_features = self._extract_temporal_memory_policy_probe_features(data, 'block12')
+
+        output = self.temporal_memory_controller.get_or_update(
+            lambda: self._profile_extract_full_features(data, len_queue=1, training_mode=False),
+            scene_token=scene_token,
+            prev_exists=prev_exists,
+            partial_current=partial_current,
+            policy_features=policy_features)
+        self._temporal_memory_commit_policy_state(
+            policy_features, l8_features=l8_features, l12_features=l12_features)
+        return output
+
+    def _profile_extract_full_features(self, data, len_queue=1, training_mode=False):
+        if self.tm_profiler is None:
+            return self.temporal_memory_adapter.extract_full_features(
+                self, data, len_queue=len_queue, training_mode=training_mode)
+        with self.tm_profiler.measure('backbone_full'):
+            return self.temporal_memory_adapter.extract_full_features(
+                self, data, len_queue=len_queue, training_mode=training_mode)
+
+    def _profile_extract_partial_features(self, data, layer_id, **kwargs):
+        if self.tm_profiler is None:
+            return self.temporal_memory_adapter.extract_partial_features(
+                self, data, layer_id, **kwargs)
+        with self.tm_profiler.measure('backbone_partial'):
+            return self.temporal_memory_adapter.extract_partial_features(
+                self, data, layer_id, **kwargs)
+
+    def _extract_temporal_memory_policy_probe_features(self, data, layer_id):
+        adapter = getattr(self, 'temporal_memory_adapter', None)
+        if adapter is None:
+            return self._profile_extract_partial_features(data, layer_id)
+        return adapter.extract_partial_features(self, data, layer_id)
+
+    def _extract_img_feat_temporal_memory_train(self, img_metas, policy_annotation_data=None, **data):
+        frame_features = []
+        distill_losses = []
+        policy_losses = []
+        T = data['img'].size(1)
+        policy_annotation_data = policy_annotation_data or {}
+        for i in range(T):
+            frame_data = dict(data)
+            frame_data['img'] = data['img'][:, i]
+            for key, value in policy_annotation_data.items():
+                frame_data[key] = self._tm_temporal_index(value, i)
+            frame_metas = img_metas[i]
+            scene_token = frame_metas[0].get('scene_token') if frame_metas else None
+            prev_exists = data.get('prev_exists', None)
+            if prev_exists is not None:
+                prev_exists = prev_exists[:, i]
+                if hasattr(prev_exists, 'numel') and prev_exists.numel() == 1:
+                    prev_exists = bool(prev_exists.item())
+
+            def extract_full():
+                full = self._profile_extract_full_features(
+                    frame_data, len_queue=1, training_mode=True)
+                return self._squeeze_temporal_feature_dim(full)
+
+            if (
+                scene_token != getattr(self.temporal_memory_controller, 'scene_token', None)
+                or not self.temporal_memory_controller._prev_exists_all(prev_exists)
+            ):
+                self._tm_previous_full_teacher = None
+
+            partial_current = None
+            l8_features = None
+            l12_features = None
+            policy_features = self._temporal_memory_policy_features(
+                frame_metas, frame_data, scene_token=scene_token)
+            action = self._temporal_memory_next_action(
+                scene_token=scene_token,
+                prev_exists=prev_exists,
+                policy_features=policy_features)
+            if (
+                self._temporal_memory_policy_needs_l8_probe()
+                and getattr(self.temporal_memory_controller, 'memory', None) is not None
+            ):
+                l8_features = self._profile_extract_partial_features(frame_data, 'block8')
+                policy_features.update(self._temporal_memory_l8_similarity_features(
+                    getattr(self, '_tm_policy_prev_l8_features', None), l8_features))
+                action = self._temporal_memory_next_action(
+                    scene_token=scene_token,
+                    prev_exists=prev_exists,
+                    policy_features=policy_features)
+            if action != 'L24':
+                layer_id = self._temporal_memory_action_layer(action)
+                partial_features = l8_features if layer_id == 'block8' and l8_features is not None else self._profile_extract_partial_features(
+                    frame_data,
+                    layer_id)
+                if layer_id == 'block8':
+                    l8_features = partial_features
+                elif layer_id == 'block12':
+                    l12_features = partial_features
+                partial_current = self._project_temporal_memory_partial(
+                    partial_features,
+                    layer_id=layer_id,
+                    action=action)
+            if self._temporal_memory_policy_needs_previous_l8_drift() and l8_features is None:
+                l8_features = self._profile_extract_partial_features(frame_data, 'block8')
+            if self._temporal_memory_policy_needs_previous_l12_drift() and l12_features is None:
+                l12_features = self._extract_temporal_memory_policy_probe_features(frame_data, 'block12')
+            policy_teacher = None
+            if self._temporal_memory_policy_supervision_active():
+                with torch.no_grad():
+                    policy_teacher = extract_full()
+                if getattr(self, '_tm_previous_full_teacher', None) is not None:
+                    policy_loss = self._temporal_memory_policy_supervision_loss(
+                        policy_features,
+                        self._tm_previous_full_teacher,
+                        policy_teacher)
+                    if policy_loss is not None:
+                        policy_losses.append(policy_loss)
+            output = self.temporal_memory_controller.get_or_update(
+                extract_full,
+                scene_token=scene_token,
+                prev_exists=prev_exists,
+                partial_current=partial_current,
+                extract_teacher=extract_full,
+                training=True,
+                policy_features=policy_features)
+            self._temporal_memory_commit_policy_state(
+                policy_features, l8_features=l8_features, l12_features=l12_features)
+            frame_features.append(output)
+            if self.temporal_memory_controller.last_distillation_loss is not None:
+                distill_losses.append(self.temporal_memory_controller.last_distillation_loss)
+            if policy_teacher is not None:
+                self._tm_previous_full_teacher = [
+                    feature.detach() for feature in policy_teacher
+                ]
+
+        features = [
+            torch.stack([frame[level] for frame in frame_features], dim=1)
+            for level in range(len(frame_features[0]))
+        ]
+        losses = self._temporal_memory_aux_losses(
+            features,
+            distill_losses=distill_losses,
+            policy_losses=policy_losses)
+        self._tm_train_step = getattr(self, '_tm_train_step', 0) + 1
+        return features, losses
+
+    def _temporal_memory_aux_losses(self, features, distill_losses=None, policy_losses=None):
+        distill_losses = distill_losses or []
+        policy_losses = policy_losses or []
+        losses = {}
+        if distill_losses:
+            losses['loss_tm_distill'] = sum(distill_losses) / len(distill_losses)
+        else:
+            controller = getattr(self, 'temporal_memory_controller', None)
+            if getattr(controller, 'train_with_teacher', False):
+                losses['loss_tm_distill'] = features[0].new_zeros(())
+        if policy_losses:
+            losses['loss_tm_policy'] = sum(policy_losses) / len(policy_losses)
+        elif self._temporal_memory_policy_supervision_active():
+            losses['loss_tm_policy'] = features[0].new_zeros(())
+        return losses
+
+    def _temporal_memory_next_action(self, scene_token=None, prev_exists=None, policy_features=None):
+        controller = self.temporal_memory_controller
+        if hasattr(controller, 'peek_action'):
+            return controller.peek_action(
+                scene_token=scene_token,
+                prev_exists=prev_exists,
+                policy_features=policy_features)
+        if controller.will_use_keyframe(scene_token=scene_token, prev_exists=prev_exists):
+            return 'L24'
+        from projects.mmdet3d_plugin.models.temporal_memory import layer_to_action
+        return layer_to_action(self.temporal_memory.get('partial_layer', 'block8')) or 'L8'
+
+    def _temporal_memory_policy_needs_l8_probe(self):
+        policy = getattr(self.temporal_memory_controller, 'policy', None)
+        if bool(getattr(policy, 'requires_l8_similarity', False)):
+            return True
+        spec = self.temporal_memory.get('policy', {})
+        return isinstance(spec, dict) and bool(spec.get('requires_l8_similarity', False))
+
+    def _temporal_memory_policy_needs_previous_l8_drift(self):
+        policy = getattr(self.temporal_memory_controller, 'policy', None)
+        if bool(getattr(policy, 'requires_previous_l8_similarity', False)):
+            return True
+        spec = self.temporal_memory.get('policy', {})
+        return isinstance(spec, dict) and bool(spec.get('requires_previous_l8_similarity', False))
+
+    def _temporal_memory_policy_needs_previous_l12_drift(self):
+        policy = getattr(self.temporal_memory_controller, 'policy', None)
+        if bool(getattr(policy, 'requires_previous_l12_similarity', False)):
+            return True
+        feature_names = getattr(policy, 'feature_names', ()) or ()
+        if 'previous_l12_similarity' in feature_names:
+            return True
+        spec = self.temporal_memory.get('policy', {})
+        if isinstance(spec, dict):
+            feature_names = spec.get('feature_names', ()) or ()
+            return bool(spec.get('requires_previous_l12_similarity', False)) or 'previous_l12_similarity' in feature_names
+        return False
+
+    def _temporal_memory_l8_similarity_features(self, previous_features, current_features):
+        if previous_features is None or current_features is None:
+            return {}
+        previous = previous_features[0] if isinstance(previous_features, (list, tuple)) else previous_features
+        current = current_features[0] if isinstance(current_features, (list, tuple)) else current_features
+        if previous.shape != current.shape or previous.dim() != 5:
+            return {}
+        cosine = F.cosine_similarity(previous.float(), current.float(), dim=2)
+        values = cosine.mean(dim=(0, 2, 3)).detach().cpu().tolist()
+        names = ('CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT', 'CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT')
+        features = {f'similarity_L8_{name}': float(value) for name, value in zip(names, values)}
+        if values:
+            features['similarity_L8_mean'] = float(sum(values) / len(values))
+            features['min_L8_similarity'] = float(min(values))
+        return features
+
+    def _temporal_memory_policy_target_index(self, value):
+        spec = self.temporal_memory.get('policy_supervision', {}) or {}
+        thresholds = tuple(spec.get('thresholds', (0.85, 0.75, 0.65)))
+        if len(thresholds) != 3:
+            raise ValueError('policy_supervision.thresholds must contain three values')
+        if value >= thresholds[0]:
+            return 0
+        if value >= thresholds[1]:
+            return 1
+        if value >= thresholds[2]:
+            return 2
+        return 3
+
+    def _temporal_memory_feature_similarity(self, previous, current):
+        values = []
+        for prev, cur in zip(previous, current):
+            prev = prev.detach().float()
+            cur = cur.detach().float()
+            if prev.shape != cur.shape:
+                raise ValueError('policy supervision features must have matching shapes')
+            if prev.dim() == 5:
+                cosine = F.cosine_similarity(prev, cur, dim=2).mean()
+            else:
+                cosine = F.cosine_similarity(prev.flatten(1), cur.flatten(1), dim=1).mean()
+            values.append(cosine)
+        return torch.stack(values).mean()
+
+    @staticmethod
+    def _temporal_memory_linear_cka(x, y, eps=1e-12):
+        x = x - x.mean(dim=0, keepdim=True)
+        y = y - y.mean(dim=0, keepdim=True)
+        xy = torch.matmul(x.transpose(0, 1), y)
+        xx = torch.matmul(x.transpose(0, 1), x)
+        yy = torch.matmul(y.transpose(0, 1), y)
+        return xy.pow(2).sum() / (xx.pow(2).sum().sqrt() * yy.pow(2).sum().sqrt() + eps)
+
+    def _temporal_memory_feature_cka(self, previous, current):
+        values = []
+        for prev, cur in zip(previous, current):
+            prev = prev.detach().float()
+            cur = cur.detach().float()
+            if prev.shape != cur.shape:
+                raise ValueError('policy supervision features must have matching shapes')
+            if prev.dim() == 5:
+                prev = prev.permute(0, 1, 3, 4, 2).reshape(-1, prev.shape[2])
+                cur = cur.permute(0, 1, 3, 4, 2).reshape(-1, cur.shape[2])
+            else:
+                prev = prev.flatten(1)
+                cur = cur.flatten(1)
+            values.append(self._temporal_memory_linear_cka(prev, cur))
+        return torch.stack(values).mean()
+
+    def _temporal_memory_policy_target_score(self, previous_full, current_full):
+        spec = self.temporal_memory.get('policy_supervision', {}) or {}
+        target = spec.get('target', 'similarity')
+        if target in ('similarity', 'similarity_L24_mean'):
+            return self._temporal_memory_feature_similarity(previous_full, current_full)
+        if target in ('cka', 'cka_L24_mean'):
+            return self._temporal_memory_feature_cka(previous_full, current_full)
+        raise ValueError(f'Unsupported temporal memory policy target: {target}')
+
+    def _temporal_memory_policy_supervision_loss(self, policy_features, previous_full, current_full):
+        policy = getattr(self, 'temporal_memory_policy', None)
+        if not isinstance(policy, torch.nn.Module) or not hasattr(policy, 'logits'):
+            return None
+        score = self._temporal_memory_policy_target_score(previous_full, current_full)
+        target_index = self._temporal_memory_policy_target_index(float(score.detach().cpu()))
+        logits = policy.logits(policy_features)
+        target = torch.as_tensor([target_index], dtype=torch.long, device=logits.device)
+        spec = self.temporal_memory.get('policy_supervision', {}) or {}
+        loss = F.cross_entropy(logits, target)
+        class_weights = spec.get('class_weights', None)
+        if class_weights is not None:
+            class_weights = torch.as_tensor(class_weights, dtype=logits.dtype, device=logits.device)
+            if class_weights.numel() != logits.shape[-1]:
+                raise ValueError('policy_supervision.class_weights must match policy class count')
+            loss = loss * class_weights[target_index]
+        weight = float(spec.get('weight', 1.0))
+        return loss * weight
+
+    def _temporal_memory_policy_supervision_active(self):
+        spec = self.temporal_memory.get('policy_supervision', None)
+        if not spec:
+            return False
+        if spec.get('enabled', True) is False:
+            return False
+        max_steps = int(spec.get('max_train_steps', 0) or 0)
+        warmup_ratio = float(spec.get('warmup_ratio', 0.1))
+        if max_steps <= 0:
+            return True
+        return getattr(self, '_tm_train_step', 0) < max(1, int(max_steps * warmup_ratio))
+
+    def _maybe_log_temporal_memory_policy_stats(self):
+        if self.tm_profiler is None or self.tm_profiler.window_reports != 0:
+            return
+        controller = getattr(self, 'temporal_memory_controller', None)
+        if controller is None or not hasattr(controller, 'policy_stats'):
+            return
+        stats = controller.policy_stats()
+        total = sum(stats.get(action, 0) for action in ('L8', 'L12', 'L16', 'L24'))
+        if total <= 0:
+            return
+        fields = []
+        for action in ('L8', 'L12', 'L16', 'L24'):
+            count = stats.get(action, 0)
+            fields.append(f'{action}={count}({count / total:.3f})')
+        fields.append(f'forced_l24={stats.get("forced_l24", 0)}')
+        fields.append(f'learned_l24={stats.get("learned_l24", 0)}')
+        fields.append(f'effective_full_rate={stats.get("L24", 0) / total:.3f}')
+        print(f'[temporal_memory_policy] samples={total} ' + ' '.join(fields))
+
+    @staticmethod
+    def _tm_scalar(value, default=0.0):
+        if value is None:
+            return default
+        if torch.is_tensor(value):
+            if value.numel() == 0:
+                return default
+            return float(value.detach().reshape(-1)[0].cpu())
+        if isinstance(value, (list, tuple)):
+            return RepDetr3D._tm_scalar(value[0], default=default) if value else default
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _tm_tensor(value):
+        if value is None:
+            return None
+        if hasattr(value, 'tensor'):
+            value = value.tensor
+        if torch.is_tensor(value):
+            return value.detach()
+        if isinstance(value, (list, tuple)) and value:
+            return RepDetr3D._tm_tensor(value[0])
+        return None
+
+    @staticmethod
+    def _tm_temporal_index(value, index):
+        if value is None:
+            return None
+        if isinstance(value, (list, tuple)):
+            return value[index] if len(value) > index else None
+        if torch.is_tensor(value) and value.dim() > 1:
+            return value[:, index]
+        return value
+
+    def _tm_pose_xy_yaw(self, data):
+        pose = self._tm_tensor(data.get('ego_pose', None))
+        if pose is None or pose.numel() < 16:
+            return 0.0, 0.0, 0.0, 0.0
+        pose = pose.reshape(-1, 4, 4)[0].float().cpu()
+        x = float(pose[0, 3])
+        y = float(pose[1, 3])
+        z = float(pose[2, 3])
+        yaw = math.atan2(float(pose[1, 0]), float(pose[0, 0]))
+        return x, y, z, yaw
+
+    @staticmethod
+    def _tm_yaw_delta(prev_yaw, cur_yaw):
+        return (cur_yaw - prev_yaw + math.pi) % (2.0 * math.pi) - math.pi
+
+    @staticmethod
+    def _load_tm_policy_offline_lookup(path):
+        if not path:
+            return None
+        lookup = {}
+        try:
+            with open(path, newline='') as handle:
+                for row in csv.DictReader(handle):
+                    token = row.get('token')
+                    scene_key = None
+                    if row.get('scene_token') is not None and row.get('frame_number') is not None:
+                        scene_key = (row.get('scene_token'), str(int(float(row.get('frame_number')))))
+                    if not token and scene_key is None:
+                        continue
+                    online_keys = {
+                        'frame_number', 'info_frame_idx', 'is_scene_start', 'dt_s',
+                        'ego_x_m', 'ego_y_m', 'ego_z_m', 'ego_yaw_deg',
+                        'delta_ego_translation_m', 'ego_speed_mps', 'ego_accel_mps2',
+                        'yaw_rate_deg_s', 'abs_yaw_rate_deg_s', 'yaw_accel_deg_s2',
+                        'abs_yaw_accel_deg_s2',
+                    }
+                    values = {}
+                    for key, value in row.items():
+                        if key in ('index', 'token', 'scene_token', 'timestamp', 'has_previous_frame') or key in online_keys:
+                            continue
+                        try:
+                            values[key] = float(value)
+                        except (TypeError, ValueError):
+                            pass
+                    if token:
+                        lookup[token] = values
+                    if scene_key is not None:
+                        lookup[scene_key] = values
+        except OSError:
+            return None
+        return lookup
+
+    def _tm_lookup_offline_features(self, img_metas):
+        lookup = getattr(self, '_tm_policy_offline_lookup', None)
+        if not lookup:
+            return None
+        meta = img_metas[0] if img_metas and isinstance(img_metas[0], dict) else {}
+        token = meta.get('token', None)
+        if token is None:
+            filename = meta.get('filename', None)
+            token = filename[0] if isinstance(filename, (list, tuple)) and filename else None
+        row = lookup.get(token)
+        if row is None and meta.get('scene_token') is not None:
+            frame_number = meta.get('frame_idx', getattr(self.temporal_memory_controller, 'frame_index', 0))
+            row = lookup.get((meta.get('scene_token'), str(int(frame_number))))
+        if row is None:
+            return None
+        features = self._tm_zero_offline_features()
+        features.update(row)
+        return features
+
+    @staticmethod
+    def _tm_zero_offline_features():
+        features = {}
+        for key in (
+            'num_annotations', 'avg_object_distance_m', 'median_object_distance_m',
+            'min_object_distance_m', 'p10_object_distance_m', 'p90_object_distance_m',
+            'avg_box_length_m', 'avg_box_width_m', 'avg_box_height_m',
+            'avg_box_volume_m3', 'avg_box_area_m2', 'avg_object_speed_mps',
+            'max_object_speed_mps', 'camera_annotation_count',
+            'max_camera_annotation_count', 'min_camera_annotation_count',
+            'avg_camera_annotation_count', 'new_object_proxy_count',
+            'matched_object_proxy_count', 'disappeared_object_proxy_count',
+            'new_object_proxy_fraction',
+        ):
+            features[key] = 0.0
+        for threshold in (10, 20, 30, 50):
+            features[f'near_object_count_{threshold}m'] = 0.0
+        return features
+
+    def _tm_annotation_features(self, data, img_metas=None):
+        features = {}
+        meta = img_metas[0] if img_metas and isinstance(img_metas[0], dict) else {}
+        boxes = self._tm_tensor(data.get('gt_bboxes_3d', None))
+        if boxes is None:
+            boxes = self._tm_tensor(meta.get('gt_bboxes_3d', None))
+        if boxes is None:
+            lookup_features = self._tm_lookup_offline_features(img_metas)
+            if lookup_features is not None:
+                return lookup_features
+        if boxes is not None and boxes.numel() > 0:
+            boxes = boxes.reshape(-1, boxes.shape[-1]).float().cpu()
+            features['num_annotations'] = float(len(boxes))
+            distances = torch.linalg.vector_norm(boxes[:, :2], dim=1)
+            features['avg_object_distance_m'] = float(distances.mean())
+            features['median_object_distance_m'] = float(distances.median())
+            features['min_object_distance_m'] = float(distances.min())
+            features['p10_object_distance_m'] = float(torch.quantile(distances, 0.1))
+            features['p90_object_distance_m'] = float(torch.quantile(distances, 0.9))
+            for threshold in (10, 20, 30, 50):
+                features[f'near_object_count_{threshold}m'] = float((distances < threshold).sum())
+            if boxes.shape[1] >= 6:
+                dims = boxes[:, 3:6].abs()
+                features['avg_box_length_m'] = float(dims[:, 0].mean())
+                features['avg_box_width_m'] = float(dims[:, 1].mean())
+                features['avg_box_height_m'] = float(dims[:, 2].mean())
+                features['avg_box_volume_m3'] = float(dims.prod(dim=1).mean())
+                features['avg_box_area_m2'] = float((dims[:, 0] * dims[:, 1]).mean())
+            if boxes.shape[1] >= 9:
+                speeds = torch.linalg.vector_norm(boxes[:, 7:9], dim=1)
+                features['avg_object_speed_mps'] = float(speeds.mean())
+                features['max_object_speed_mps'] = float(speeds.max())
+        else:
+            features.update(self._tm_zero_offline_features())
+        gt_bboxes = data.get('gt_bboxes', None)
+        if isinstance(gt_bboxes, (list, tuple)):
+            counts = []
+            for item in gt_bboxes:
+                tensor = self._tm_tensor(item)
+                counts.append(0 if tensor is None or tensor.numel() == 0 else int(tensor.reshape(-1, tensor.shape[-1]).shape[0]))
+            if counts:
+                features['camera_annotation_count'] = float(sum(counts))
+                features['max_camera_annotation_count'] = float(max(counts))
+                features['min_camera_annotation_count'] = float(min(counts))
+                features['avg_camera_annotation_count'] = float(sum(counts) / len(counts))
+        prev = getattr(self, '_tm_policy_prev_state', None)
+        prev_gt = None if prev is None else prev.get('current_gt_boxes', None)
+        features.update(self._tm_new_object_proxy_features(prev_gt, boxes))
+        return features
+
+    @staticmethod
+    def _tm_new_object_proxy_features(previous_boxes, current_boxes, match_distance_m=2.0):
+        if previous_boxes is None or current_boxes is None:
+            current_count = 0 if current_boxes is None else int(current_boxes.reshape(-1, current_boxes.shape[-1]).shape[0])
+            return dict(
+                new_object_proxy_count=float(current_count),
+                matched_object_proxy_count=0.0,
+                disappeared_object_proxy_count=0.0,
+                new_object_proxy_fraction=float(1.0 if current_count else 0.0),
+            )
+        previous = previous_boxes.reshape(-1, previous_boxes.shape[-1]).float().cpu()
+        current = current_boxes.reshape(-1, current_boxes.shape[-1]).float().cpu()
+        used = set()
+        matched = 0
+        for cur in current:
+            if previous.numel() == 0:
+                break
+            distances = torch.linalg.vector_norm(previous[:, :2] - cur[:2], dim=1)
+            best = int(distances.argmin().item())
+            if best not in used and float(distances[best]) <= match_distance_m:
+                used.add(best)
+                matched += 1
+        new_count = int(len(current) - matched)
+        disappeared = int(len(previous) - matched)
+        return dict(
+            new_object_proxy_count=float(new_count),
+            matched_object_proxy_count=float(matched),
+            disappeared_object_proxy_count=float(disappeared),
+            new_object_proxy_fraction=float(new_count / len(current)) if len(current) else 0.0,
+        )
+
+    def _tm_prediction_features(self, bbox_results):
+        features = self._tm_zero_offline_features()
+        if not bbox_results:
+            return features
+        result = bbox_results[0]
+        boxes = result.get('boxes_3d', None)
+        if boxes is None:
+            boxes = result.get('bboxes_3d', None)
+        scores = result.get('scores_3d', None)
+        boxes = self._tm_tensor(boxes)
+        if boxes is None or boxes.numel() == 0:
+            return features
+        boxes = boxes.reshape(-1, boxes.shape[-1]).float().cpu()
+        if scores is not None:
+            scores = self._tm_tensor(scores)
+            if scores is not None and scores.numel() == len(boxes):
+                threshold = float(self.temporal_memory.get('policy_prediction_score_thr', 0.1))
+                boxes = boxes[scores.reshape(-1).float().cpu() >= threshold]
+        if boxes.numel() == 0:
+            return features
+        distances = torch.linalg.vector_norm(boxes[:, :2], dim=1)
+        features['num_annotations'] = float(len(boxes))
+        features['avg_object_distance_m'] = float(distances.mean())
+        features['median_object_distance_m'] = float(distances.median())
+        features['min_object_distance_m'] = float(distances.min())
+        features['p10_object_distance_m'] = float(torch.quantile(distances, 0.1))
+        features['p90_object_distance_m'] = float(torch.quantile(distances, 0.9))
+        for threshold in (10, 20, 30, 50):
+            features[f'near_object_count_{threshold}m'] = float((distances < threshold).sum())
+        if boxes.shape[1] >= 6:
+            dims = boxes[:, 3:6].abs()
+            features['avg_box_length_m'] = float(dims[:, 0].mean())
+            features['avg_box_width_m'] = float(dims[:, 1].mean())
+            features['avg_box_height_m'] = float(dims[:, 2].mean())
+            features['avg_box_volume_m3'] = float(dims.prod(dim=1).mean())
+            features['avg_box_area_m2'] = float((dims[:, 0] * dims[:, 1]).mean())
+        return features
+
+    def _tm_policy_offline_mode(self):
+        return self.temporal_memory.get('policy_offline_features', None)
+
+    def _tm_apply_policy_offline_features(self, features, current_gt_features):
+        mode = self._tm_policy_offline_mode()
+        if not mode:
+            return
+        if mode == 'teacher_forcing':
+            mode = 'previous_gt' if self.training else 'previous_prediction'
+        prev = getattr(self, '_tm_policy_prev_state', None)
+        previous_gt = None if prev is None else prev.get('offline_gt_features', None)
+        if mode == 'current_gt':
+            features.update(current_gt_features)
+        elif mode == 'previous_gt':
+            features.update(previous_gt or self._tm_zero_offline_features())
+        elif mode == 'previous_prediction':
+            features.update(getattr(self, '_tm_policy_prev_prediction_features', None) or self._tm_zero_offline_features())
+        else:
+            raise ValueError(f'Unsupported temporal memory policy_offline_features: {mode}')
+
+    def _temporal_memory_policy_features(self, img_metas, data, scene_token=None, l8_similarity=None):
+        meta = img_metas[0] if img_metas and isinstance(img_metas[0], dict) else {}
+        frame_number = int(meta.get('frame_idx', getattr(self.temporal_memory_controller, 'frame_index', 0)))
+        timestamp = self._tm_scalar(data.get('timestamp', meta.get('timestamp', 0.0)))
+        x, y, z, yaw = self._tm_pose_xy_yaw(data)
+        prev = getattr(self, '_tm_policy_prev_state', None)
+        is_scene_start = prev is None or prev.get('scene_token') != scene_token
+        dt = 0.0
+        delta = 0.0
+        speed = 0.0
+        accel = 0.0
+        yaw_rate = 0.0
+        yaw_accel = 0.0
+        if not is_scene_start:
+            raw_dt = timestamp - prev.get('timestamp', timestamp)
+            dt = raw_dt / 1e6 if abs(raw_dt) > 1000.0 else raw_dt
+            if dt > 0.0:
+                delta = math.hypot(x - prev.get('ego_x_m', x), y - prev.get('ego_y_m', y))
+                speed = delta / dt
+                yaw_rate = math.degrees(self._tm_yaw_delta(prev.get('ego_yaw_rad', yaw), yaw)) / dt
+                accel = (speed - prev.get('ego_speed_mps', 0.0)) / dt
+                yaw_accel = (yaw_rate - prev.get('yaw_rate_deg_s', 0.0)) / dt
+        features = dict(
+            frame_number=float(frame_number),
+            info_frame_idx=float(meta.get('frame_idx', frame_number)),
+            is_scene_start=float(is_scene_start),
+            dt_s=float(dt),
+            ego_x_m=float(x),
+            ego_y_m=float(y),
+            ego_z_m=float(z),
+            ego_yaw_deg=float(math.degrees(yaw)),
+            delta_ego_translation_m=float(delta),
+            ego_speed_mps=float(speed),
+            ego_accel_mps2=float(accel),
+            yaw_rate_deg_s=float(yaw_rate),
+            abs_yaw_rate_deg_s=float(abs(yaw_rate)),
+            yaw_accel_deg_s2=float(yaw_accel),
+            abs_yaw_accel_deg_s2=float(abs(yaw_accel)),
+        )
+        current_gt_features = self._tm_annotation_features(data, img_metas=img_metas)
+        self._tm_apply_policy_offline_features(features, current_gt_features)
+        previous_l8_similarity = getattr(self, '_tm_policy_previous_l8_similarity', None)
+        if not is_scene_start and previous_l8_similarity is not None:
+            features['previous_l8_similarity'] = float(previous_l8_similarity)
+        previous_l12_similarity = getattr(self, '_tm_policy_previous_l12_similarity', None)
+        if not is_scene_start and previous_l12_similarity is not None:
+            features['previous_l12_similarity'] = float(previous_l12_similarity)
+        if l8_similarity:
+            features.update(l8_similarity)
+        current_gt_boxes = self._tm_tensor(data.get('gt_bboxes_3d', None))
+        if current_gt_boxes is None:
+            current_gt_boxes = self._tm_tensor(meta.get('gt_bboxes_3d', None))
+        features['_state'] = dict(
+            scene_token=scene_token,
+            timestamp=timestamp,
+            ego_x_m=x,
+            ego_y_m=y,
+            ego_yaw_rad=yaw,
+            ego_speed_mps=speed,
+            yaw_rate_deg_s=yaw_rate,
+            is_scene_start=is_scene_start,
+            offline_gt_features=current_gt_features,
+            current_gt_boxes=current_gt_boxes.detach().cpu() if current_gt_boxes is not None else None,
+        )
+        return features
+
+    def _temporal_memory_commit_policy_state(self, policy_features, l8_features=None, l12_features=None):
+        state = policy_features.get('_state', None) if policy_features is not None else None
+        if policy_features is not None:
+            self._tm_policy_prev_state = state
+        if l8_features is not None:
+            feature = l8_features[0] if isinstance(l8_features, (list, tuple)) else l8_features
+            previous_l8_features = getattr(self, '_tm_policy_prev_l8_features', None)
+            if state is not None and state.get('is_scene_start', False):
+                self._tm_policy_previous_l8_similarity = None
+            elif previous_l8_features is not None:
+                similarity = self._temporal_memory_l8_similarity_features(
+                    previous_l8_features,
+                    feature)
+                self._tm_policy_previous_l8_similarity = similarity.get('similarity_L8_mean', None)
+            if hasattr(feature, 'detach'):
+                self._tm_policy_prev_l8_features = feature.detach()
+        if l12_features is not None:
+            feature = l12_features[0] if isinstance(l12_features, (list, tuple)) else l12_features
+            previous_l12_features = getattr(self, '_tm_policy_prev_l12_features', None)
+            if state is not None and state.get('is_scene_start', False):
+                self._tm_policy_previous_l12_similarity = None
+            elif previous_l12_features is not None:
+                similarity = self._temporal_memory_l8_similarity_features(
+                    previous_l12_features,
+                    feature)
+                self._tm_policy_previous_l12_similarity = similarity.get('similarity_L8_mean', None)
+            if hasattr(feature, 'detach'):
+                self._tm_policy_prev_l12_features = feature.detach()
+
+    def _temporal_memory_action_layer(self, action):
+        from projects.mmdet3d_plugin.models.temporal_memory import action_to_layer
+        layer = action_to_layer(action)
+        if layer is None:
+            return self.temporal_memory.get('partial_layer', 'middle')
+        return f'block{layer}'
+
+    def _project_temporal_memory_partial(self, partial_features, layer_id=None, action=None):
+        projector = self.temporal_memory_projector
+        try:
+            signature = inspect.signature(projector.forward if isinstance(projector, torch.nn.Module) else projector)
+        except (TypeError, ValueError):
+            return projector(partial_features)
+        kwargs = {}
+        if 'layer_id' in signature.parameters:
+            kwargs['layer_id'] = layer_id
+        if 'action' in signature.parameters:
+            kwargs['action'] = action
+        return projector(partial_features, **kwargs)
+
+    @staticmethod
+    def _squeeze_temporal_feature_dim(features):
+        squeezed = []
+        for feature in features:
+            if feature.dim() == 6 and feature.size(1) == 1:
+                squeezed.append(feature[:, 0])
+            else:
+                squeezed.append(feature)
+        return squeezed
+
+    def _temporal_memory_parameter_anchor_loss(self):
+        modules = [getattr(self, 'temporal_memory_projector', None)]
+        modules.append(getattr(self, 'temporal_memory_updater', None))
+        modules.append(getattr(self, 'temporal_memory_policy', None))
+
+        anchor = None
+        for module in modules:
+            if not isinstance(module, torch.nn.Module):
+                continue
+            for param in module.parameters():
+                if not param.requires_grad:
+                    continue
+                term = param.float().sum() * 0.0
+                anchor = term if anchor is None else anchor + term
+        return anchor
+
+    def _freeze_temporal_memory_pretrained_detector(self):
+        for param in self.parameters():
+            param.requires_grad = False
+        for module in (
+            getattr(self, 'temporal_memory_projector', None),
+            getattr(self, 'temporal_memory_updater', None),
+            getattr(self, 'temporal_memory_policy', None),
+        ):
+            if not isinstance(module, torch.nn.Module):
+                continue
+            for param in module.parameters():
+                param.requires_grad = True
    
 
     def extract_img_feat(self, img, len_queue=1, training_mode=False):
@@ -98,6 +986,7 @@ class RepDetr3D(MVXTwoStageDetector):
                 img_feat_reshaped = img_feats[i].view(B, int(BN/B/len_queue), C, H, W)
                 img_feats_reshaped.append(img_feat_reshaped)
 
+        self._maybe_log_tm_shapes(img_feats_reshaped)
         return img_feats_reshaped
 
 
@@ -252,24 +1141,46 @@ class RepDetr3D(MVXTwoStageDetector):
             self.pts_bbox_head.reset_memory()
             self.test_flag = False
 
-        T = data['img'].size(1)
-
-        prev_img = data['img'][:, :-self.num_frame_backbone_grads]
-        rec_img = data['img'][:, -self.num_frame_backbone_grads:]
-        rec_img_feats = self.extract_feat(rec_img, self.num_frame_backbone_grads)
-
-        if T-self.num_frame_backbone_grads > 0:
-            self.eval()
-            with torch.no_grad():
-                prev_img_feats = self.extract_feat(prev_img, T-self.num_frame_backbone_grads, True)
-            self.train()
-            data['img_feats'] = [torch.cat([prev_img_feats[i], rec_img_feats[i]], dim=1) for i in range(len(self.position_level))]
+        tm_losses = {}
+        if (
+            self.temporal_memory_enabled
+            and self.temporal_memory.get('updater', 'reuse') != 'reuse'
+        ):
+            policy_annotation_data = dict(
+                gt_bboxes_3d=gt_bboxes_3d,
+                gt_labels_3d=gt_labels_3d,
+                gt_bboxes=gt_bboxes,
+                gt_labels=gt_labels,
+            )
+            data['img_feats'], tm_losses = self._extract_img_feat_temporal_memory_train(
+                img_metas, policy_annotation_data=policy_annotation_data, **data)
         else:
-            data['img_feats'] = rec_img_feats
+            T = data['img'].size(1)
+
+            prev_img = data['img'][:, :-self.num_frame_backbone_grads]
+            rec_img = data['img'][:, -self.num_frame_backbone_grads:]
+            rec_img_feats = self.extract_feat(rec_img, self.num_frame_backbone_grads)
+
+            if T-self.num_frame_backbone_grads > 0:
+                self.eval()
+                with torch.no_grad():
+                    prev_img_feats = self.extract_feat(prev_img, T-self.num_frame_backbone_grads, True)
+                self.train()
+                data['img_feats'] = [torch.cat([prev_img_feats[i], rec_img_feats[i]], dim=1) for i in range(len(self.position_level))]
+            else:
+                data['img_feats'] = rec_img_feats
 
         losses = self.obtain_history_memory(gt_bboxes_3d,
                         gt_labels_3d, gt_bboxes,
                         gt_labels, img_metas, centers2d, depths, gt_bboxes_ignore, **data)
+        losses.update(tm_losses)
+        if (
+            self.temporal_memory_enabled
+            and self.temporal_memory.get('updater', 'reuse') != 'reuse'
+        ):
+            anchor_loss = self._temporal_memory_parameter_anchor_loss()
+            if anchor_loss is not None:
+                losses['loss_tm_param_anchor'] = anchor_loss
 
         return losses
   
@@ -305,17 +1216,25 @@ class RepDetr3D(MVXTwoStageDetector):
             bbox3d2result(bboxes, scores, labels)
             for bboxes, scores, labels in bbox_list
         ]
+        self._tm_policy_prev_prediction_features = self._tm_prediction_features(bbox_results)
         return bbox_results
     
     def simple_test(self, img_metas, **data):
         """Test function without augmentaiton."""
-        data['img_feats'] = self.extract_img_feat(data['img'], 1)
+        if self.tm_profiler is not None:
+            self.tm_profiler.reset()
+        with self.tm_profiler.measure('total') if self.tm_profiler is not None else _nullcontext():
+            data['img_feats'] = self._extract_img_feat_temporal_memory(img_metas, **data)
 
-        bbox_list = [dict() for i in range(len(img_metas))]
-        bbox_pts = self.simple_test_pts(
-            img_metas, **data)
-        for result_dict, pts_bbox in zip(bbox_list, bbox_pts):
-            result_dict['pts_bbox'] = pts_bbox
+            bbox_list = [dict() for i in range(len(img_metas))]
+            with self.tm_profiler.measure('head') if self.tm_profiler is not None else _nullcontext():
+                bbox_pts = self.simple_test_pts(
+                    img_metas, **data)
+            for result_dict, pts_bbox in zip(bbox_list, bbox_pts):
+                result_dict['pts_bbox'] = pts_bbox
+        if self.tm_profiler is not None:
+            self.tm_profiler.log()
+            self._maybe_log_temporal_memory_policy_stats()
         return bbox_list
 
     
