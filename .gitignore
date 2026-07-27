@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Local datasets, runs, and checkpoints.
+data/
+ckpts/
+work_dirs/
+wandb/
+val/
+*.pth
+*.pt
+*.ckpt
