@@ -70,6 +70,33 @@ def test_repdetr3d_depth_router_metadata_is_per_sample_and_rejects_gt_keys():
         )
 
 
+def test_repdetr3d_configures_mod_router_with_zero_indexed_global_blocks():
+    from projects.mmdet3d_plugin.models.detectors.repdetr3d import RepDetr3D
+
+    class Backbone(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+
+        def configure_temporal_mod(self, **kwargs):
+            self.kwargs = kwargs
+
+    model = RepDetr3D.__new__(RepDetr3D)
+    torch.nn.Module.__init__(model)
+    model.img_backbone = Backbone()
+    model.temporal_memory = dict(mod_router=dict(
+        enabled=True,
+        routed_blocks=(9, 12, 15, 18, 21),
+        capacity_ratio=0.5,
+        router_hidden_channels=32,
+        adapter_hidden_channels=16,
+    ))
+
+    model._configure_temporal_mod_from_config()
+
+    assert model.img_backbone.kwargs["routed_block_indices"] == (8, 11, 14, 17, 20)
+    assert model.img_backbone.kwargs["capacity_ratio"] == 0.5
+
+
 def test_repdetr3d_depth_router_groups_continuations_and_restores_sample_order():
     """Catches a branch that treats per-sample router actions as per-batch."""
     from projects.mmdet3d_plugin.models.detectors.repdetr3d import RepDetr3D

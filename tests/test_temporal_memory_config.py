@@ -198,6 +198,7 @@ def test_depth_router_config_is_online_only_reset5_and_single_sample_eval():
     assert router["target_cost"] == 0.5
     assert all("gt" not in name.lower() for name in router["feature_names"])
     assert all("drift" not in name.lower() for name in router["feature_names"])
+    assert namespace["data"]["samples_per_gpu"] == 4
     assert namespace["router_eval_cfg"]["data"]["samples_per_gpu"] == 1
 
 
@@ -218,6 +219,8 @@ def test_mod_configs_use_global_half_capacity_and_differ_by_training_regime():
         mod_router = namespace["model"]["temporal_memory"]["mod_router"]
         assert mod_router["routed_blocks"] == (9, 12, 15, 18, 21)
         assert mod_router["capacity_ratio"] == 0.5
+        if name == "frozen":
+            assert namespace["data"]["samples_per_gpu"] == 4
         assert namespace["router_eval_cfg"]["data"]["samples_per_gpu"] == 1
 
     assert configs["frozen"]["model"]["temporal_memory"]["mod_router"]["train_backbone"] is False

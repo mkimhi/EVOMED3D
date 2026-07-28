@@ -6,6 +6,7 @@ find_unused_parameters = False
 
 # Evaluation is batch-one because deployment routes one temporal sample at once.
 router_eval_cfg = dict(data=dict(samples_per_gpu=1))
+data = dict(samples_per_gpu=4)
 
 model = dict(
     temporal_memory=dict(
