@@ -82,6 +82,7 @@ class RepDetr3D(MVXTwoStageDetector):
         self.temporal_memory_projector = None
         self.temporal_memory_updater = None
         self.temporal_memory_policy = None
+        self.temporal_memory_depth_router = None
         self._tm_train_step = 0
         self._tm_previous_full_teacher = None
         self._tm_policy_prev_state = None
@@ -98,6 +99,7 @@ class RepDetr3D(MVXTwoStageDetector):
             self.tm_profiler = TemporalMemoryProfiler(enabled=True)
         if self.temporal_memory_enabled:
             from projects.mmdet3d_plugin.models.temporal_memory import (
+                DepthExitRouter,
                 LayeredPartialFeatureProjector,
                 PartialFeatureProjector,
                 TemporalMemoryController,
@@ -133,7 +135,9 @@ class RepDetr3D(MVXTwoStageDetector):
                 self.temporal_memory_updater = self.temporal_memory_controller.updater
             if isinstance(self.temporal_memory_controller.policy, torch.nn.Module):
                 self.temporal_memory_policy = self.temporal_memory_controller.policy
-            if self.temporal_memory.get('updater', 'reuse') != 'reuse':
+            router_cfg = dict(self.temporal_memory.get('router', {}) or {})
+            use_depth_router = router_cfg.get('type') in ('depth_exit', 'depth_router')
+            if self.temporal_memory.get('updater', 'reuse') != 'reuse' or use_depth_router:
                 projector_cfg = dict(self.temporal_memory.get('projector_cfg', {}))
                 if self.temporal_memory.get('projectors_per_layer', True):
                     self.temporal_memory_projector = LayeredPartialFeatureProjector(
@@ -143,6 +147,16 @@ class RepDetr3D(MVXTwoStageDetector):
                     )
                 else:
                     self.temporal_memory_projector = PartialFeatureProjector(**projector_cfg)
+            if use_depth_router:
+                feature_dim = int(router_cfg.get(
+                    'feature_dim', projector_cfg.get('out_channels', 256)))
+                self.temporal_memory_depth_router = DepthExitRouter(
+                    feature_dim=feature_dim,
+                    metadata_dim=len(tuple(router_cfg.get('feature_names', ()))),
+                    hidden_dim=int(router_cfg.get('hidden_dim', 128)),
+                    temperature=float(router_cfg.get('temperature', 1.0)),
+                    costs=tuple(router_cfg.get('costs', (8 / 24, 12 / 24, 16 / 24, 1.0))),
+                )
             if self.temporal_memory.get('freeze_pretrained_detector', False):
                 self._freeze_temporal_memory_pretrained_detector()
 
@@ -161,6 +175,10 @@ class RepDetr3D(MVXTwoStageDetector):
                 return self.extract_img_feat(data['img'], 1)
             with self.tm_profiler.measure('backbone_full'):
                 return self.extract_img_feat(data['img'], 1)
+
+        if self._tm_depth_router_enabled():
+            features, _ = self._tm_route_depth_batch(data, img_metas, training=False)
+            return features
 
         scene_token = img_metas[0].get('scene_token') if img_metas else None
         prev_exists = data.get('prev_exists', None)
@@ -244,6 +262,7 @@ class RepDetr3D(MVXTwoStageDetector):
         frame_features = []
         distill_losses = []
         policy_losses = []
+        router_losses = []
         T = data['img'].size(1)
         policy_annotation_data = policy_annotation_data or {}
         for i in range(T):
@@ -258,6 +277,13 @@ class RepDetr3D(MVXTwoStageDetector):
                 prev_exists = prev_exists[:, i]
                 if hasattr(prev_exists, 'numel') and prev_exists.numel() == 1:
                     prev_exists = bool(prev_exists.item())
+
+            if self._tm_depth_router_enabled():
+                output, route_losses = self._tm_route_depth_batch(
+                    frame_data, frame_metas, training=True)
+                frame_features.append(output)
+                router_losses.append(route_losses)
+                continue
 
             def extract_full():
                 full = self._profile_extract_full_features(
@@ -343,13 +369,17 @@ class RepDetr3D(MVXTwoStageDetector):
         losses = self._temporal_memory_aux_losses(
             features,
             distill_losses=distill_losses,
-            policy_losses=policy_losses)
+            policy_losses=policy_losses,
+            router_losses=router_losses)
         self._tm_train_step = getattr(self, '_tm_train_step', 0) + 1
         return features, losses
 
-    def _temporal_memory_aux_losses(self, features, distill_losses=None, policy_losses=None):
+    def _temporal_memory_aux_losses(
+        self, features, distill_losses=None, policy_losses=None, router_losses=None,
+    ):
         distill_losses = distill_losses or []
         policy_losses = policy_losses or []
+        router_losses = router_losses or []
         losses = {}
         if distill_losses:
             losses['loss_tm_distill'] = sum(distill_losses) / len(distill_losses)
@@ -361,6 +391,11 @@ class RepDetr3D(MVXTwoStageDetector):
             losses['loss_tm_policy'] = sum(policy_losses) / len(policy_losses)
         elif self._temporal_memory_policy_supervision_active():
             losses['loss_tm_policy'] = features[0].new_zeros(())
+        if router_losses:
+            for key in ('loss_tm_budget', 'loss_tm_balance'):
+                values = [item[key] for item in router_losses if key in item]
+                if values:
+                    losses[key] = sum(values) / len(values)
         return losses
 
     def _temporal_memory_next_action(self, scene_token=None, prev_exists=None, policy_features=None):
@@ -908,6 +943,235 @@ class RepDetr3D(MVXTwoStageDetector):
             values.append([float(row.get(name, 0.0) or 0.0) for name in feature_names])
         return torch.as_tensor(values, device=device, dtype=dtype)
 
+    def _tm_depth_router_enabled(self):
+        return getattr(self, 'temporal_memory_depth_router', None) is not None
+
+    @staticmethod
+    def _tm_depth_router_tokens_to_spatial(tokens, batch_size, num_cams):
+        if tokens.dim() != 4:
+            raise ValueError('EVA tokens must be [B*N_cam, H, W, C]')
+        if tokens.size(0) != batch_size * num_cams:
+            raise ValueError('token batch must equal batch_size * num_cams')
+        height, width, channels = tokens.shape[1:]
+        return tokens.permute(0, 3, 1, 2).reshape(
+            batch_size, num_cams, channels, height, width)
+
+    def _tm_depth_router_grouped_partial_features(
+        self, l8_tokens, batch_size, num_cams, actions, l8_projected,
+    ):
+        """Run only the selected L12/L16 continuations for a routed batch.
+
+        ``actions`` is deliberately indexed by sample, not camera.  Every
+        selected sample contributes all of its camera tokens to the same
+        continuation group, and each group remains in its own (stable) sample
+        order until the caller scatters detector features back to batch order.
+        """
+        if actions.dim() != 1 or actions.numel() != batch_size:
+            raise ValueError('depth-router actions must be one per sample')
+        if not isinstance(l8_projected, (list, tuple)):
+            raise ValueError('L8 projector output must be a feature list')
+
+        partials = {}
+        l8_indices = torch.nonzero(actions == 0, as_tuple=False).flatten()
+        if l8_indices.numel():
+            partials[0] = [feature.index_select(0, l8_indices) for feature in l8_projected]
+
+        tokens_by_sample = l8_tokens.reshape(
+            batch_size, num_cams, *l8_tokens.shape[1:])
+        for action_index, stop_at in ((1, 11), (2, 15)):
+            sample_indices = torch.nonzero(actions == action_index, as_tuple=False).flatten()
+            if not sample_indices.numel():
+                continue
+            grouped_tokens = tokens_by_sample.index_select(0, sample_indices).reshape(
+                -1, *l8_tokens.shape[1:])
+            continued = self.img_backbone.forward_blocks(
+                grouped_tokens, start_index=8, stop_at=stop_at)
+            spatial = self._tm_depth_router_tokens_to_spatial(
+                continued, int(sample_indices.numel()), num_cams)
+            action = ('L12', 'L16')[action_index - 1]
+            partials[action_index] = self._project_temporal_memory_partial(
+                spatial, layer_id=f'block{stop_at + 1}', action=action)
+        return partials
+
+    def _tm_depth_router_prepare_l8(self, data):
+        """Compute the shared L8 prefix once for every sample and camera."""
+        img = data['img']
+        if img.dim() != 5:
+            raise ValueError('depth routing expects per-frame images [B, N_cam, C, H, W]')
+        batch_size, num_cams = img.shape[:2]
+        flat_img = img.reshape(batch_size * num_cams, *img.shape[2:])
+        if self.use_grid_mask:
+            flat_img = self.grid_mask(flat_img)
+        tokens = self.img_backbone.prepare_tokens(flat_img)
+        l8_tokens = self.img_backbone.forward_blocks(tokens, start_index=0, stop_at=7)
+        l8_spatial = self._tm_depth_router_tokens_to_spatial(
+            l8_tokens, batch_size, num_cams)
+        l8_projected = self._project_temporal_memory_partial(
+            l8_spatial, layer_id='block8', action='L8')
+        return l8_tokens, l8_projected
+
+    @staticmethod
+    def _tm_depth_router_batch_value(value, index, default=0.0):
+        if value is None:
+            return default
+        if torch.is_tensor(value):
+            if value.numel() == 0:
+                return default
+            value = value.reshape(-1)[min(index, value.numel() - 1)].item()
+        elif isinstance(value, (list, tuple)):
+            if not value:
+                return default
+            value = value[min(index, len(value) - 1)]
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _tm_depth_router_online_rows(self, img_metas, data):
+        """Collect only values available at inference for each sample router."""
+        router_cfg = self.temporal_memory.get('router', {}) or {}
+        feature_names = tuple(router_cfg.get('feature_names', ()))
+        forbidden = {'gt_bboxes_3d', 'gt_labels_3d', 'num_annotations'}
+        if forbidden.intersection(feature_names):
+            raise ValueError('depth router accepts online-only metadata')
+        rows = []
+        for index, meta in enumerate(img_metas):
+            meta = meta or {}
+            row = {}
+            for name in feature_names:
+                if name == 'frame_number':
+                    value = meta.get('frame_idx', 0.0)
+                else:
+                    value = meta.get(name, None)
+                    if value is None:
+                        value = self._tm_depth_router_batch_value(data.get(name), index)
+                row[name] = self._tm_depth_router_batch_value(value, 0)
+            rows.append(row)
+        return rows
+
+    @staticmethod
+    def _tm_depth_router_sample_key(meta, index):
+        # Batch index distinguishes parallel clips that belong to one scene.
+        return (meta.get('scene_token', None), int(index))
+
+    def _tm_depth_router_previous_memory(self, sample_keys, current_l8):
+        previous = []
+        states = getattr(self.temporal_memory_controller, 'states', {})
+        for index, sample_key in enumerate(sample_keys):
+            state = states.get(sample_key)
+            memory = None if state is None else state.get('memory')
+            if memory is None:
+                previous.append(torch.zeros_like(current_l8[index:index + 1]))
+                continue
+            feature = memory[0] if isinstance(memory, (list, tuple)) else memory
+            if feature.shape[1:] != current_l8.shape[1:]:
+                raise ValueError('cached memory must match the L8 router feature shape')
+            previous.append(feature)
+        return torch.cat(previous, dim=0)
+
+    def _tm_depth_router_extract_full_group(self, data, indices, training):
+        index_tensor = torch.as_tensor(indices, device=data['img'].device, dtype=torch.long)
+        group_data = dict(data)
+        group_data['img'] = data['img'].index_select(0, index_tensor)
+        full = self._profile_extract_full_features(
+            group_data, len_queue=1, training_mode=bool(training))
+        return self._squeeze_temporal_feature_dim(full)
+
+    @staticmethod
+    def _tm_depth_router_select_group_feature(features, group_indices, sample_index):
+        local_index = group_indices.index(sample_index)
+        return [feature[local_index:local_index + 1] for feature in features]
+
+    def _tm_depth_router_forced_actions(self, sample_keys, scene_tokens, prev_exists, actions):
+        forced = actions.clone()
+        controller = self.temporal_memory_controller
+        states = getattr(controller, 'states', {})
+        for index, sample_key in enumerate(sample_keys):
+            state = states.get(sample_key)
+            no_memory = state is None or state.get('memory') is None
+            scene_changed = state is not None and state.get('scene_token') != scene_tokens[index]
+            max_full = getattr(controller, 'max_frames_between_full', None)
+            age = 0 if state is None else state.get('frames_since_full', 0)
+            reset_due = max_full is not None and age >= int(max_full) - 1
+            if no_memory or scene_changed or not bool(prev_exists[index]) or reset_due:
+                forced[index] = 3
+        return forced
+
+    def _tm_route_depth_batch(self, data, img_metas, training=False):
+        """Hard-route a batch by depth while retaining independent cache states."""
+        from projects.mmdet3d_plugin.models.temporal_memory import depth_router_losses
+
+        batch_size, num_cams = data['img'].shape[:2]
+        if len(img_metas) != batch_size:
+            raise ValueError('depth router requires one metadata dict per sample')
+        l8_tokens, l8_projected = self._tm_depth_router_prepare_l8(data)
+        sample_keys = [self._tm_depth_router_sample_key(meta, index)
+                       for index, meta in enumerate(img_metas)]
+        scene_tokens = [meta.get('scene_token') for meta in img_metas]
+        prev_value = data.get('prev_exists', None)
+        prev_exists = [bool(self._tm_depth_router_batch_value(prev_value, index, 1.0))
+                       for index in range(batch_size)]
+        metadata = self._tm_depth_router_metadata_tensor(
+            self._tm_depth_router_online_rows(img_metas, data),
+            device=l8_projected[0].device,
+            dtype=l8_projected[0].dtype)
+        route = self.temporal_memory_depth_router(
+            current_l8=l8_projected[0],
+            previous_memory=self._tm_depth_router_previous_memory(sample_keys, l8_projected[0]),
+            metadata=metadata,
+            training=training)
+        actions = self._tm_depth_router_forced_actions(
+            sample_keys, scene_tokens, prev_exists, route.hard_actions)
+        partial_groups = self._tm_depth_router_grouped_partial_features(
+            l8_tokens=l8_tokens,
+            batch_size=batch_size,
+            num_cams=num_cams,
+            actions=actions,
+            l8_projected=l8_projected)
+        action_indices = {
+            action_index: torch.nonzero(actions == action_index, as_tuple=False).flatten().tolist()
+            for action_index in range(4)
+        }
+        full_features = None
+        if action_indices[3]:
+            full_features = self._tm_depth_router_extract_full_group(
+                data, action_indices[3], training)
+
+        names = ('L8', 'L12', 'L16', 'L24')
+        requests = []
+        for index, action_index in enumerate(actions.tolist()):
+            action = names[action_index]
+            if action == 'L24':
+                current_full = self._tm_depth_router_select_group_feature(
+                    full_features, action_indices[3], index)
+                request = dict(extract_full=lambda value=current_full: value)
+            else:
+                partial = self._tm_depth_router_select_group_feature(
+                    partial_groups[action_index], action_indices[action_index], index)
+                # Straight-through selected-route scaling is exactly one in the
+                # forward pass, but exposes the detection loss to router logits.
+                selector = route.hard_one_hot[index, action_index]
+                request = dict(partial_current=[feature * selector for feature in partial])
+            request.update(
+                sample_key=sample_keys[index],
+                scene_token=scene_tokens[index],
+                prev_exists=prev_exists[index],
+                action=action,
+            )
+            requests.append(request)
+        outputs = self.temporal_memory_controller.get_or_update_samples(
+            requests, training=training)
+        features = [torch.cat([output[level] for output in outputs], dim=0)
+                    for level in range(len(outputs[0]))]
+        router_cfg = self.temporal_memory.get('router', {}) or {}
+        losses = depth_router_losses(
+            route,
+            target_cost=router_cfg.get('target_cost', 0.5),
+            balance_prior=router_cfg.get('balance_prior', None),
+            balance_weight=router_cfg.get('balance_weight', 0.0))
+        losses.pop('expected_cost', None)
+        return features, losses
+
     def _project_temporal_memory_partial(self, partial_features, layer_id=None, action=None):
         projector = self.temporal_memory_projector
         try:
@@ -935,6 +1199,7 @@ class RepDetr3D(MVXTwoStageDetector):
         modules = [getattr(self, 'temporal_memory_projector', None)]
         modules.append(getattr(self, 'temporal_memory_updater', None))
         modules.append(getattr(self, 'temporal_memory_policy', None))
+        modules.append(getattr(self, 'temporal_memory_depth_router', None))
 
         anchor = None
         for module in modules:
@@ -954,6 +1219,7 @@ class RepDetr3D(MVXTwoStageDetector):
             getattr(self, 'temporal_memory_projector', None),
             getattr(self, 'temporal_memory_updater', None),
             getattr(self, 'temporal_memory_policy', None),
+            getattr(self, 'temporal_memory_depth_router', None),
         ):
             if not isinstance(module, torch.nn.Module):
                 continue

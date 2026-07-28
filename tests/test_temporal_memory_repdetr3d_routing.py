@@ -70,6 +70,110 @@ def test_repdetr3d_depth_router_metadata_is_per_sample_and_rejects_gt_keys():
         )
 
 
+def test_repdetr3d_depth_router_groups_continuations_and_restores_sample_order():
+    """Catches a branch that treats per-sample router actions as per-batch."""
+    from projects.mmdet3d_plugin.models.detectors.repdetr3d import RepDetr3D
+
+    class Backbone:
+        def __init__(self):
+            self.calls = []
+
+        def forward_blocks(self, tokens, start_index, stop_at):
+            self.calls.append((tokens[:, 0, 0, 0].tolist(), start_index, stop_at))
+            return tokens + float(stop_at + 1)
+
+    model = RepDetr3D.__new__(RepDetr3D)
+    model.img_backbone = Backbone()
+    model._project_temporal_memory_partial = lambda features, **kwargs: [features]
+
+    # B=4, N_cam=2.  The first coordinate carries the original sample index.
+    l8_tokens = torch.zeros(8, 1, 1, 1)
+    l8_tokens[:, 0, 0, 0] = torch.arange(8)
+    l8_projected = [torch.arange(8, dtype=torch.float32).view(4, 2, 1, 1, 1)]
+
+    partials = model._tm_depth_router_grouped_partial_features(
+        l8_tokens=l8_tokens,
+        batch_size=4,
+        num_cams=2,
+        actions=torch.tensor([0, 1, 3, 2]),  # L8, L12, L24, L16
+        l8_projected=l8_projected,
+    )
+
+    assert partials[0][0][:, 0, 0, 0, 0].tolist() == [0.0]
+    assert partials[1][0][:, 0, 0, 0, 0].tolist() == [14.0]
+    assert partials[2][0][:, 0, 0, 0, 0].tolist() == [22.0]
+    assert 3 not in partials
+    assert model.img_backbone.calls == [([2.0, 3.0], 8, 11), ([6.0, 7.0], 8, 15)]
+
+
+def test_repdetr3d_depth_router_executes_one_action_per_sample_and_returns_batch_order():
+    """Catches a router path that accidentally applies one route to all samples."""
+    from projects.mmdet3d_plugin.models.detectors.repdetr3d import RepDetr3D
+    from projects.mmdet3d_plugin.models.temporal_memory.routers import DepthRouteOutput
+
+    class Router:
+        def __call__(self, **kwargs):
+            logits = torch.zeros(4, 4, requires_grad=True)
+            probabilities = logits.softmax(dim=-1)
+            hard = torch.eye(4, dtype=torch.float32)[torch.tensor([0, 1, 3, 2])]
+            return DepthRouteOutput(
+                logits=logits,
+                probabilities=probabilities,
+                hard_actions=torch.tensor([0, 1, 3, 2]),
+                hard_one_hot=hard,
+                expected_cost=probabilities.new_tensor(0.625),
+            )
+
+    class Controller:
+        def __init__(self):
+            self.states = {
+                (scene, index): dict(
+                    scene_token=scene,
+                    frames_since_full=0,
+                    memory=[torch.ones(1, 2, 1, 1, 1)],
+                )
+                for index, scene in enumerate(('a', 'b', 'c', 'd'))
+            }
+
+        def get_or_update_samples(self, requests, training=False):
+            self.requests = requests
+            return [
+                request['extract_full']() if request['action'] == 'L24'
+                else request['partial_current']
+                for request in requests
+            ]
+
+    model = RepDetr3D.__new__(RepDetr3D)
+    model.temporal_memory = dict(router=dict(feature_names=('speed',), target_cost=0.5))
+    model.temporal_memory_depth_router = Router()
+    model.temporal_memory_controller = Controller()
+    model._tm_depth_router_prepare_l8 = lambda data: (
+        torch.zeros(8, 1, 1, 1), [torch.ones(4, 2, 1, 1, 1)])
+    model._tm_depth_router_grouped_partial_features = lambda **kwargs: {
+        0: [torch.full((1, 2, 1, 1, 1), 8.0)],
+        1: [torch.full((1, 2, 1, 1, 1), 12.0)],
+        2: [torch.full((1, 2, 1, 1, 1), 16.0)],
+    }
+    model._tm_depth_router_extract_full_group = lambda data, indices, training: [
+        torch.full((len(indices), 2, 1, 1, 1), 24.0)]
+
+    features, losses = model._tm_route_depth_batch(
+        dict(img=torch.randn(4, 2, 3, 8, 8)),
+        [
+            {'scene_token': 'a', 'speed': 1.0},
+            {'scene_token': 'b', 'speed': 2.0},
+            {'scene_token': 'c', 'speed': 3.0},
+            {'scene_token': 'd', 'speed': 4.0},
+        ],
+        training=True,
+    )
+
+    assert [request['action'] for request in model.temporal_memory_controller.requests] == [
+        'L8', 'L12', 'L24', 'L16']
+    assert features[0][:, 0, 0, 0, 0].tolist() == [8.0, 12.0, 24.0, 16.0]
+    assert set(losses) == {'loss_tm_budget', 'loss_tm_balance'}
+
+
 def test_repdetr3d_training_temporal_path_stacks_features_and_distill_loss():
     from projects.mmdet3d_plugin.models.detectors.repdetr3d import RepDetr3D
     from projects.mmdet3d_plugin.models.temporal_memory import TemporalMemoryController
