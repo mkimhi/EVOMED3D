@@ -802,6 +802,7 @@ class Block(nn.Module):
         drop_path=0.0,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), 
         window_size=0,
+        is_local_window_attention=None,
         use_residual_block=False,
         rope=None,
         flash_attn=True,
@@ -848,6 +849,9 @@ class Block(nn.Module):
             )
 
         self.window_size = window_size
+        if is_local_window_attention is None:
+            is_local_window_attention = window_size > 0
+        self.is_local_window_attention = bool(is_local_window_attention)
 
         self.use_residual_block = use_residual_block
         if use_residual_block:
@@ -899,10 +903,10 @@ class Block(nn.Module):
         return shortcut + routing_weights.unsqueeze(-1) * update
 
     def forward_mod(self, x, router, adapter=None, capacity_ratio=0.5):
-        """Run a fixed-capacity packed token path through a global block."""
+        """Run fixed-capacity packed tokens inside each global EVA window."""
         from ..temporal_memory.routers import select_topk_tokens
 
-        if self.window_size > 0:
+        if self.is_local_window_attention:
             raise ValueError('temporal MoD supports global-attention blocks only')
         if self.use_residual_block:
             raise ValueError('temporal MoD does not support spatial residual blocks')
@@ -910,14 +914,28 @@ class Block(nn.Module):
             raise ValueError('temporal MoD input must be [B*N_cam, H, W, C]')
 
         batch, height, width, channels = x.shape
-        flat = x.reshape(batch, height * width, channels)
-        scores = router(x)
+        routed_input = x
+        valid_tokens = torch.ones(
+            (batch, height, width, 1), device=x.device, dtype=torch.bool
+        )
+        pad_hw = None
+        windows_per_camera = 1
+        if self.window_size > 0:
+            routed_input, pad_hw = window_partition(x, self.window_size)
+            valid_tokens, _ = window_partition(valid_tokens, self.window_size)
+            windows_per_camera = routed_input.size(0) // batch
+
+        routed_batch, routed_height, routed_width, _ = routed_input.shape
+        flat = routed_input.reshape(routed_batch, routed_height * routed_width, channels)
+        valid_tokens = valid_tokens.reshape(routed_batch, routed_height * routed_width)
+        scores = router(routed_input)
         if scores.shape != flat.shape[:2]:
-            raise ValueError('token router must return [B*N_cam, H*W] scores')
-        indices, mask = select_topk_tokens(scores, capacity_ratio)
+            raise ValueError('token router must return one score per token in every attention window')
+        indices, mask = select_topk_tokens(scores, capacity_ratio, valid_mask=valid_tokens)
         gather_index = indices.unsqueeze(-1).expand(-1, -1, channels)
         selected = flat.gather(1, gather_index)
         selected_scores = scores.gather(1, indices)
+        selected_valid = valid_tokens.gather(1, indices)
         routing_weights = selected_scores.sigmoid()
 
         if self.with_cp and self.training:
@@ -932,13 +950,22 @@ class Block(nn.Module):
         else:
             routed = self._forward_mod_selected(selected, indices, routing_weights, adapter)
 
-        output = flat.scatter(1, gather_index, routed).reshape(batch, height, width, channels)
+        output = flat.scatter(1, gather_index, routed).reshape(
+            routed_batch, routed_height, routed_width, channels
+        )
+        if self.window_size > 0:
+            output = window_unpartition(
+                output, self.window_size, pad_hw, (height, width)
+            )
         stats = {
             'selected_indices': indices.detach(),
             'selection_mask': mask.detach(),
             'selected_count': indices.size(1),
             'token_count': flat.size(1),
             'capacity_ratio': float(capacity_ratio),
+            'windows_per_camera': windows_per_camera,
+            'valid_token_count': valid_tokens.sum(dim=1).detach(),
+            'valid_selected_count': selected_valid.sum(dim=1).detach(),
             'mean_routing_weight': routing_weights.detach().mean(),
         }
         return output, stats
@@ -1051,6 +1078,7 @@ class EVAViT(nn.Module):
                 drop_path=dpr[i],
                 norm_layer=norm_layer,
                 window_size=window_size if i in window_block_indexes else global_window_size,
+                is_local_window_attention=i in window_block_indexes,
                 use_residual_block=i in residual_block_indexes,
                 rope=self.rope_win if i in window_block_indexes else self.rope_glb,
                 flash_attn=flash_attn,
@@ -1123,7 +1151,7 @@ class EVAViT(nn.Module):
                 raise ValueError(f'temporal MoD block index {index} is out of range')
             if index == len(self.blocks) - 1:
                 raise ValueError('temporal MoD keeps the final block dense')
-            if self.blocks[index].window_size > 0:
+            if self.blocks[index].is_local_window_attention:
                 raise ValueError(
                     f'temporal MoD block {index} must be a global-attention block'
                 )
