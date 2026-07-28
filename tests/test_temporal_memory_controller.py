@@ -394,3 +394,21 @@ def test_controller_passes_policy_features_to_mlp_policy(tmp_path):
         policy_features={"risk": -1.0},
     ) == "unused"
     assert controller.last_action == "L24"
+
+
+def test_controller_keeps_memory_state_separate_for_batched_sample_requests():
+    import torch
+    from projects.mmdet3d_plugin.models.temporal_memory import TemporalMemoryController
+
+    controller = TemporalMemoryController(enabled=True, updater="partial_only")
+    first = controller.get_or_update_samples([
+        dict(sample_key="a", scene_token="scene-a", action="L24", extract_full=lambda: torch.tensor([1.])),
+        dict(sample_key="b", scene_token="scene-b", action="L24", extract_full=lambda: torch.tensor([2.])),
+    ])
+    second = controller.get_or_update_samples([
+        dict(sample_key="a", scene_token="scene-a", action="L8", partial_current=torch.tensor([3.]), extract_full=lambda: torch.tensor([9.])),
+        dict(sample_key="b", scene_token="scene-b", action="L8", partial_current=torch.tensor([4.]), extract_full=lambda: torch.tensor([9.])),
+    ])
+
+    assert [value.item() for value in first] == [1.0, 2.0]
+    assert [value.item() for value in second] == [3.0, 4.0]
