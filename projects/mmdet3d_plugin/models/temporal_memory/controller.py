@@ -38,7 +38,6 @@ class TemporalMemoryController:
         self.last_action_forced = False
         self.last_distillation_loss = None
         self.max_frames_between_full = max_frames_between_full
-<<<<<<< HEAD
         self.adaptive_reset = adaptive_reset or {}
         self._policy_stats = {
             'forced_l24': 0,
@@ -47,10 +46,6 @@ class TemporalMemoryController:
             'learned_l24': 0,
         }
         self.states = {}
-=======
-        self._policy_stats = {'forced_l24': 0, 'learned_l24': 0}
-        self.states = {}
->>>>>>> 2e94dbe (feat: cache temporal memory per sample)
         self.policy = build_frame_policy(
             policy,
             keyframe_interval=keyframe_interval,
@@ -273,7 +268,6 @@ class TemporalMemoryController:
                 action = 'L24'
             if action == 'L24':
                 output = request['extract_full']()
-                state['memory'] = output
                 state['frames_since_full'] = 0
             else:
                 output = self._call_updater(
@@ -282,8 +276,11 @@ class TemporalMemoryController:
                     ego_motion_embedding=request.get('ego_motion_embedding'),
                     action=action,
                 )
-                state['memory'] = output
                 state['frames_since_full'] += 1
+            # The cache survives minibatches, whereas an autograd graph does
+            # not.  Keep the current output connected to its detection loss,
+            # but truncate history before it can be read by another frame.
+            state['memory'] = self._detach_memory(output) if training else output
             state['frame_index'] += 1
             self.last_action = action
             self.last_action_forced = forced
@@ -293,53 +290,15 @@ class TemporalMemoryController:
             outputs.append(output)
         return outputs
 
-    def get_or_update_samples(self, requests, training=False):
-        """Update independent temporal-memory states in request order.
-
-        Each request contains a stable ``sample_key``, an already-selected
-        ``action``, and a single-sample feature tensor. This is deliberately
-        separate from policy selection: a detector can select and group routes
-        for a batch, while this controller owns only per-sequence cache state.
-        """
-        outputs = []
-        for request in requests:
-            sample_key = request['sample_key']
-            state = self.states.get(sample_key)
-            if state is None:
-                state = dict(scene_token=None, frame_index=0, frames_since_full=0, memory=None)
-                self.states[sample_key] = state
-
-            scene_token = request.get('scene_token')
-            prev_exists = request.get('prev_exists', True)
-            if scene_token != state['scene_token'] or not self._prev_exists_all(prev_exists):
-                state.update(scene_token=scene_token, frame_index=0, frames_since_full=0, memory=None)
-
-            action = request.get('action', 'L24')
-            forced = (
-                state['memory'] is None
-                or (self.max_frames_between_full is not None
-                    and state['frames_since_full'] >= int(self.max_frames_between_full) - 1)
-            )
-            if not self.enabled or forced:
-                action = 'L24'
-            if action == 'L24':
-                output = request['extract_full']()
-                state['memory'] = output
-                state['frames_since_full'] = 0
-            else:
-                output = self._call_updater(
-                    state['memory'],
-                    partial_current=request.get('partial_current'),
-                    ego_motion_embedding=request.get('ego_motion_embedding'),
-                    action=action,
-                )
-                state['memory'] = output
-                state['frames_since_full'] += 1
-            state['frame_index'] += 1
-            self.last_action = action
-            self.last_action_forced = forced
-            self._policy_stats[action] = self._policy_stats.get(action, 0) + 1
-            if forced:
-                self._policy_stats['forced_l24'] = self._policy_stats.get('forced_l24', 0) + 1
-            outputs.append(output)
-        return outputs
+    @staticmethod
+    def _detach_memory(memory):
+        if torch.is_tensor(memory):
+            return memory.detach()
+        if isinstance(memory, tuple):
+            return tuple(TemporalMemoryController._detach_memory(value) for value in memory)
+        if isinstance(memory, list):
+            return [TemporalMemoryController._detach_memory(value) for value in memory]
+        if isinstance(memory, dict):
+            return {key: TemporalMemoryController._detach_memory(value)
+                    for key, value in memory.items()}
+        return memory
