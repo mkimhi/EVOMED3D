@@ -378,6 +378,27 @@ class VisionRotaryEmbeddingFast(nn.Module):
 
     def forward(self, t): return  t * self.freqs_cos + rotate_half(t) * self.freqs_sin
 
+    def forward_indices(self, t, indices):
+        """Apply rotary embeddings at selected original spatial positions."""
+        if indices.dim() != 2:
+            raise ValueError('RoPE indices must be [B, K]')
+        if t.dim() not in (3, 4) or t.size(0) != indices.size(0) or t.size(-2) != indices.size(1):
+            raise ValueError('selected RoPE tokens and indices must agree on [B, K]')
+        if indices.numel() and (indices.min() < 0 or indices.max() >= self.freqs_cos.size(0)):
+            raise ValueError('RoPE index exceeds the configured spatial token grid')
+
+        flat_indices = indices.reshape(-1)
+        cos = self.freqs_cos.index_select(0, flat_indices).view(
+            indices.size(0), indices.size(1), -1
+        )
+        sin = self.freqs_sin.index_select(0, flat_indices).view(
+            indices.size(0), indices.size(1), -1
+        )
+        if t.dim() == 4:
+            cos = cos.unsqueeze(1)
+            sin = sin.unsqueeze(1)
+        return t * cos + rotate_half(t) * sin
+
 
 class FrozenBatchNorm2d(nn.Module):
     """
@@ -657,10 +678,8 @@ class Attention(nn.Module):
             factory_kwargs = {'device': 'cuda', 'dtype': torch.float16}
             self.inner_attn = FlashAttention(attention_dropout=0.0, **factory_kwargs)
 
-    def forward(self, x):
-        B, H, W, C = x.shape
-        x = x.view(B, -1, C)
-        N = H * W
+    def _forward_sequence(self, x, rope_indices=None):
+        B, N, C = x.shape
 
         q = F.linear(input=x, weight=self.q_proj.weight, bias=self.q_bias)
         k = F.linear(input=x, weight=self.k_proj.weight, bias=None)
@@ -671,8 +690,13 @@ class Attention(nn.Module):
         v = v.reshape(B, N, self.num_heads, -1).permute(0, 2, 1, 3) 
 
         ## rope
-        q = self.rope(q).type_as(v)
-        k = self.rope(k).type_as(v)
+        if self.rope is not None:
+            if rope_indices is None:
+                q = self.rope(q).type_as(v)
+                k = self.rope(k).type_as(v)
+            else:
+                q = self.rope.forward_indices(q, rope_indices).type_as(v)
+                k = self.rope.forward_indices(k, rope_indices).type_as(v)
 
         if self.flash_attn:
             q = q.permute(0, 2, 1, 3)   # B, num_heads, N, C -> B, N, num_heads, C
@@ -692,9 +716,17 @@ class Attention(nn.Module):
             x = self.inner_attn_ln(x)
 
         x = self.proj(x)
-        x = x.view(B, H, W, C)
-
         return x
+
+    def forward_selected(self, x, indices):
+        if x.dim() != 3:
+            raise ValueError('selected attention tokens must be [B, K, C]')
+        return self._forward_sequence(x, rope_indices=indices)
+
+    def forward(self, x):
+        B, H, W, C = x.shape
+        x = self._forward_sequence(x.reshape(B, H * W, C))
+        return x.reshape(B, H, W, C)
 
 
 class ResBottleneckBlock(CNNBlockBase):
@@ -857,6 +889,60 @@ class Block(nn.Module):
             x = self._forward(x)
         return x
 
+    def _forward_mod_selected(self, selected, indices, routing_weights, adapter):
+        shortcut = selected
+        selected = shortcut + self.drop_path(self.attn.forward_selected(self.norm1(selected), indices))
+        selected = selected + self.drop_path(self.mlp(self.norm2(selected)))
+        update = selected - shortcut
+        if adapter is not None:
+            update = update + adapter(selected)
+        return shortcut + routing_weights.unsqueeze(-1) * update
+
+    def forward_mod(self, x, router, adapter=None, capacity_ratio=0.5):
+        """Run a fixed-capacity packed token path through a global block."""
+        from ..temporal_memory.routers import select_topk_tokens
+
+        if self.window_size > 0:
+            raise ValueError('temporal MoD supports global-attention blocks only')
+        if self.use_residual_block:
+            raise ValueError('temporal MoD does not support spatial residual blocks')
+        if x.dim() != 4:
+            raise ValueError('temporal MoD input must be [B*N_cam, H, W, C]')
+
+        batch, height, width, channels = x.shape
+        flat = x.reshape(batch, height * width, channels)
+        scores = router(x)
+        if scores.shape != flat.shape[:2]:
+            raise ValueError('token router must return [B*N_cam, H*W] scores')
+        indices, mask = select_topk_tokens(scores, capacity_ratio)
+        gather_index = indices.unsqueeze(-1).expand(-1, -1, channels)
+        selected = flat.gather(1, gather_index)
+        selected_scores = scores.gather(1, indices)
+        routing_weights = selected_scores.sigmoid()
+
+        if self.with_cp and self.training:
+            routed = cp.checkpoint(
+                lambda token_input, position_input, weight_input: self._forward_mod_selected(
+                    token_input, position_input, weight_input, adapter
+                ),
+                selected,
+                indices,
+                routing_weights,
+            )
+        else:
+            routed = self._forward_mod_selected(selected, indices, routing_weights, adapter)
+
+        output = flat.scatter(1, gather_index, routed).reshape(batch, height, width, channels)
+        stats = {
+            'selected_indices': indices.detach(),
+            'selection_mask': mask.detach(),
+            'selected_count': indices.size(1),
+            'token_count': flat.size(1),
+            'capacity_ratio': float(capacity_ratio),
+            'mean_routing_weight': routing_weights.detach().mean(),
+        }
+        return output, stats
+
 @BACKBONES.register_module()
 class EVAViT(nn.Module):
     """
@@ -978,6 +1064,14 @@ class EVAViT(nn.Module):
         self._out_feature_strides = {out_feature: patch_size}
         self._out_features = [out_feature]
 
+        # Empty module dictionaries add no parameters or state-dict keys, so
+        # the pretrained dense backbone remains unchanged until configured.
+        self.temporal_mod_routers = nn.ModuleDict()
+        self.temporal_mod_adapters = nn.ModuleDict()
+        self._temporal_mod_block_indices = ()
+        self._temporal_mod_capacity_ratio = None
+        self._temporal_mod_stats = {}
+
         self.adapter = None
         if sim_fpn is not None:
             self.adapter = SimpleFeaturePyramid(**sim_fpn)
@@ -1005,6 +1099,61 @@ class EVAViT(nn.Module):
             )
         return x
 
+    def configure_temporal_mod(
+        self,
+        routed_block_indices=(8, 11, 14, 17, 20),
+        capacity_ratio=0.5,
+        router_hidden_channels=256,
+        adapter_hidden_channels=256,
+    ):
+        """Attach independent fixed-capacity routers to global EVA blocks.
+
+        Block indices are zero-based. The final EVA block is intentionally
+        kept dense as a recovery block.
+        """
+        from ..temporal_memory.routers import TokenDepthAdapter, TokenDepthRouter
+
+        if not 0.0 < float(capacity_ratio) <= 1.0:
+            raise ValueError('capacity_ratio must be in (0, 1]')
+        indices = tuple(int(index) for index in routed_block_indices)
+        if len(set(indices)) != len(indices):
+            raise ValueError('temporal MoD routed block indices must be unique')
+        for index in indices:
+            if index < 0 or index >= len(self.blocks):
+                raise ValueError(f'temporal MoD block index {index} is out of range')
+            if index == len(self.blocks) - 1:
+                raise ValueError('temporal MoD keeps the final block dense')
+            if self.blocks[index].window_size > 0:
+                raise ValueError(
+                    f'temporal MoD block {index} must be a global-attention block'
+                )
+
+        channels = next(iter(self._out_feature_channels.values()))
+        routers = {}
+        adapters = {}
+        for index in indices:
+            key = str(index)
+            routers[key] = TokenDepthRouter(channels, router_hidden_channels)
+            if adapter_hidden_channels is not None:
+                adapters[key] = TokenDepthAdapter(channels, adapter_hidden_channels)
+        self.temporal_mod_routers = nn.ModuleDict(routers)
+        self.temporal_mod_adapters = nn.ModuleDict(adapters)
+        self._temporal_mod_block_indices = indices
+        self._temporal_mod_capacity_ratio = float(capacity_ratio)
+        self._temporal_mod_stats = {}
+        return self
+
+    def clear_temporal_mod(self):
+        """Remove all routed junctions and restore the original dense path."""
+        self.temporal_mod_routers = nn.ModuleDict()
+        self.temporal_mod_adapters = nn.ModuleDict()
+        self._temporal_mod_block_indices = ()
+        self._temporal_mod_capacity_ratio = None
+        self._temporal_mod_stats = {}
+
+    def get_temporal_mod_stats(self):
+        return dict(self._temporal_mod_stats)
+
     def forward_blocks(self, x, start_index=0, stop_at=None):
         if start_index < 0 or start_index >= len(self.blocks):
             raise ValueError(f'start_index must be in [0, {len(self.blocks) - 1}], got {start_index}')
@@ -1013,9 +1162,21 @@ class EVAViT(nn.Module):
         if stop_at < start_index or stop_at >= len(self.blocks):
             raise ValueError(f'stop_at must be in [{start_index}, {len(self.blocks) - 1}], got {stop_at}')
 
+        self._temporal_mod_stats = {}
         for index in range(start_index, stop_at + 1):
             blk = self.blocks[index]
-            x = blk(x)   # b, h, w, c
+            key = str(index)
+            if key in self.temporal_mod_routers:
+                adapter = self.temporal_mod_adapters[key] if key in self.temporal_mod_adapters else None
+                x, stats = blk.forward_mod(
+                    x,
+                    self.temporal_mod_routers[key],
+                    adapter,
+                    self._temporal_mod_capacity_ratio,
+                )
+                self._temporal_mod_stats[index] = stats
+            else:
+                x = blk(x)   # b, h, w, c
         return x
 
     def _forward_blocks(self, x, stop_at=None):

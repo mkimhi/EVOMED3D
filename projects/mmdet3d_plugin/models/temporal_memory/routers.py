@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import math
 
 import torch
 from torch import nn
@@ -101,3 +102,66 @@ def depth_router_losses(output, target_cost=0.5, balance_prior=None, balance_wei
         'loss_tm_balance': balance,
         'expected_cost': output.expected_cost.detach(),
     }
+
+
+def select_topk_tokens(scores, capacity_ratio=0.5):
+    """Select a fixed token capacity independently for every camera.
+
+    Args:
+        scores (Tensor): Router scores with shape ``[B * N_cam, N_token]``.
+        capacity_ratio (float): Fraction of tokens sent through the routed block.
+
+    Returns:
+        tuple: Selected flat token indices ``[B * N_cam, K]`` and a dense
+        boolean selection mask ``[B * N_cam, N_token]``.
+    """
+    if scores.dim() != 2:
+        raise ValueError('token router scores must be two-dimensional [B*N_cam, N_token]')
+    if not 0.0 < float(capacity_ratio) <= 1.0:
+        raise ValueError('capacity_ratio must be in (0, 1]')
+    if scores.size(1) == 0:
+        raise ValueError('token router cannot select from an empty sequence')
+
+    capacity = int(math.ceil(scores.size(1) * float(capacity_ratio)))
+    indices = scores.topk(capacity, dim=-1, largest=True, sorted=True).indices
+    mask = torch.zeros_like(scores, dtype=torch.bool)
+    mask.scatter_(1, indices, True)
+    return indices, mask
+
+
+class TokenDepthRouter(nn.Module):
+    """Score dense image tokens for a fixed-capacity MoD junction."""
+
+    def __init__(self, channels, hidden_channels=256):
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.LayerNorm(channels),
+            nn.Linear(channels, hidden_channels),
+            nn.GELU(),
+            nn.Linear(hidden_channels, 1),
+        )
+
+    def forward(self, tokens):
+        if tokens.dim() != 4:
+            raise ValueError('token router input must be [B*N_cam, H, W, C]')
+        return self.network(tokens).reshape(tokens.size(0), -1)
+
+
+class TokenDepthAdapter(nn.Module):
+    """Depth-specific residual adapter for selected tokens.
+
+    The output projection starts at zero so attaching an adapter does not add
+    an untrained residual to a routed pretrained block.
+    """
+
+    def __init__(self, channels, hidden_channels=256):
+        super().__init__()
+        self.norm = nn.LayerNorm(channels)
+        self.down = nn.Linear(channels, hidden_channels)
+        self.activation = nn.GELU()
+        self.up = nn.Linear(hidden_channels, channels)
+        nn.init.zeros_(self.up.weight)
+        nn.init.zeros_(self.up.bias)
+
+    def forward(self, tokens):
+        return self.up(self.activation(self.down(self.norm(tokens))))
