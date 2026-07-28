@@ -39,7 +39,7 @@ All cameras and all tokens of a sample follow one selected depth:
 
 | Action | Encoder work | Detector feature path |
 |---|---|---|
-| `L8` | blocks 1--8 | `DepthExitAdapter[L8]` -> partial projector -> temporal updater |
+| `L8` | blocks 1--8 | existing partial projector -> temporal updater |
 | `L12` | blocks 1--12 | `DepthExitAdapter[L12]` -> partial projector -> temporal updater |
 | `L16` | blocks 1--16 | `DepthExitAdapter[L16]` -> partial projector -> temporal updater |
 | `L24` | full blocks 1--24 | existing full detector feature path and memory refresh |
@@ -50,7 +50,7 @@ The first 8 blocks are always evaluated for non-keyframe candidates because `L8`
 
 ### Adapters
 
-Use independent `DepthExitAdapter`s for `L8`, `L12`, and `L16`. Each is a lightweight pre-normalized residual MLP or 1x1 spatial adapter at the EVA feature dimension. It aligns that depth's feature geometry before the existing `PartialFeatureProjector` maps it into the RepDETR3D detector feature interface. `L24` uses the existing full neck/feature path without an extra exit adapter.
+Keep the established `L8` and `L24` paths unchanged: `L8` uses the existing partial projector/updater path and `L24` uses the existing full neck/feature path. Add independent `DepthExitAdapter`s only for the unproven `L12` and `L16` exits. Each is a lightweight pre-normalized residual MLP or 1x1 spatial adapter at the EVA feature dimension, placed before the existing `PartialFeatureProjector` maps it into the RepDETR3D detector feature interface.
 
 The adapters may be warmed up before router training by minimizing stop-gradient full-feature reconstruction at the detector feature interface. This warm-up is optional and isolated from the router objective; router training itself uses no feature/diff/drift target.
 
@@ -70,7 +70,7 @@ The primary target is `target_cost=0.50`; the forced `L24` reset frames are incl
 
 ### Initial Experiments
 
-1. Frozen EVA-02; warm up all three exit adapters; train router, partial projectors, gated updater, and detector head using detection plus budget losses.
+1. Frozen EVA-02; warm up the L12/L16 exit adapters; train router, partial projectors, gated updater, and detector head using detection plus budget losses.
 2. Same as (1), without adapter warm-up.
 3. Same as (1), target normalized compute 0.50 and reset-5, with `lambda_balance=0` after warm-up.
 
@@ -80,7 +80,7 @@ The primary comparison is against the existing four-level MLP policy with reset-
 
 ### Backbone Placement and Capacity
 
-Keep blocks 1--8 dense. Apply MoD routing at every other later block: `9, 11, 13, 15, 17, 19, 21, 23` (one-indexed). The intervening blocks and block 24 remain dense. This gives each selected routing block a later full-compute recovery block, following the successful alternating-route structure reported by Mixture-of-Depths.
+Keep blocks 1--8 dense. EVA-02 alternates window-attention and global-attention blocks; arbitrary packed-token routing is only well-defined for the existing global-attention implementation. Apply MoD routing at the later global blocks `9, 12, 15, 18, 21` (one-indexed). The intervening window blocks and the final block 24 remain dense. This gives every selected routing block a later full-compute recovery block while retaining the pretrained positional/window behavior.
 
 At every routed block and for every camera independently, score all spatial tokens and select exactly the top 50% for the expensive block path. The same capacity ratio is enforced for every camera and temporal sample, yielding a unified predictable frame budget without camera-specific depth choices. Non-selected tokens bypass the heavy block through its residual connection. Top-k selection therefore fixes the routed capacity exactly; no learned drift or budget-prediction target is used.
 
@@ -145,9 +145,9 @@ Append rows to `RESULTS.md`; leave metric columns blank until each run completes
 
 1. `RepDETR3D EVA02 depth router L8/L12/L16/L24 detection+budget target50 reset5 frozen EVA adapter warm-up`.
 2. `RepDETR3D EVA02 depth router L8/L12/L16/L24 detection+budget target50 reset5 frozen EVA no adapter warm-up`.
-3. `RepDETR3D EVA02 MoD alternating blocks 9--23 capacity50 frozen EVA`.
-4. `RepDETR3D EVA02 MoD alternating blocks 9--23 capacity50 frozen EVA adapter warm-up`.
-5. `RepDETR3D EVA02 MoD alternating blocks 9--23 capacity50 N-vium-style joint training`.
+3. `RepDETR3D EVA02 MoD global blocks 9-12-15-18-21 capacity50 frozen EVA`.
+4. `RepDETR3D EVA02 MoD global blocks 9-12-15-18-21 capacity50 frozen EVA adapter warm-up`.
+5. `RepDETR3D EVA02 MoD global blocks 9-12-15-18-21 capacity50 N-vium-style joint training`.
 
 Each row must state that inputs are online-only, no GT and no drift target are used, and list the exact train/test command. The MoD rows must identify frozen versus joint backbone as a controlled experimental difference.
 
