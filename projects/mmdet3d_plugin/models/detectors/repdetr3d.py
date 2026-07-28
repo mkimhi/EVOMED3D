@@ -159,6 +159,8 @@ class RepDetr3D(MVXTwoStageDetector):
                 )
             if self.temporal_memory.get('freeze_pretrained_detector', False):
                 self._freeze_temporal_memory_pretrained_detector()
+            elif self.temporal_memory.get('freeze_backbone_only', False):
+                self._freeze_temporal_memory_backbone_only()
             self._configure_temporal_mod_from_config()
 
     def _maybe_log_tm_shapes(self, img_feats):
@@ -1251,6 +1253,11 @@ class RepDetr3D(MVXTwoStageDetector):
                 continue
             for param in module.parameters():
                 param.requires_grad = True
+
+    def _freeze_temporal_memory_backbone_only(self):
+        """Freeze EVA while retaining detector and temporal-router learning."""
+        for param in self.img_backbone.parameters():
+            param.requires_grad = False
    
 
     def extract_img_feat(self, img, len_queue=1, training_mode=False):

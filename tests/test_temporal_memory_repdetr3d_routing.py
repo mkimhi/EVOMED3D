@@ -332,6 +332,22 @@ def test_repdetr3d_temporal_memory_freeze_keeps_only_tm_modules_trainable():
     assert all(param.requires_grad for param in model.temporal_memory_policy.parameters())
 
 
+def test_repdetr3d_backbone_only_freeze_preserves_detector_and_router_training():
+    from projects.mmdet3d_plugin.models.detectors.repdetr3d import RepDetr3D
+
+    model = RepDetr3D.__new__(RepDetr3D)
+    torch.nn.Module.__init__(model)
+    model.img_backbone = torch.nn.Linear(2, 2)
+    model.pts_bbox_head = torch.nn.Linear(2, 2)
+    model.temporal_memory_depth_router = torch.nn.Linear(2, 2)
+
+    model._freeze_temporal_memory_backbone_only()
+
+    assert not any(param.requires_grad for param in model.img_backbone.parameters())
+    assert all(param.requires_grad for param in model.pts_bbox_head.parameters())
+    assert all(param.requires_grad for param in model.temporal_memory_depth_router.parameters())
+
+
 def test_repdetr3d_mlp_policy_detects_previous_l12_similarity_feature():
     from projects.mmdet3d_plugin.models.detectors.repdetr3d import RepDetr3D
     from projects.mmdet3d_plugin.models.temporal_memory.policies import build_frame_policy
