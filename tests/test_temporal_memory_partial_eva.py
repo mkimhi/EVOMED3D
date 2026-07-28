@@ -30,6 +30,33 @@ def test_eva_vit_returns_one_requested_intermediate_feature():
     assert tuple(feature.shape) == (2, 16, 4, 4)
 
 
+@pytest.mark.parametrize("stop_at", [1, 3])
+def test_eva_vit_continuation_matches_direct_prefix(stop_at):
+    from projects.mmdet3d_plugin.models.backbones.eva_vit import EVAViT
+
+    backbone = EVAViT(
+        img_size=64,
+        patch_size=16,
+        embed_dim=16,
+        depth=4,
+        num_heads=2,
+        window_size=4,
+        global_window_size=4,
+        sim_fpn=None,
+        flash_attn=False,
+        with_cp=False,
+    ).eval()
+    images = torch.randn(2, 3, 64, 64)
+
+    with torch.no_grad():
+        tokens = backbone.prepare_tokens(images)
+        first = backbone.forward_blocks(tokens, start_index=0, stop_at=0)
+        continued = backbone.forward_blocks(first, start_index=1, stop_at=stop_at)
+        direct = backbone.forward_blocks(tokens, start_index=0, stop_at=stop_at)
+
+    assert torch.allclose(continued, direct, atol=1e-5, rtol=1e-5)
+
+
 def test_repdetr3d_adapter_extracts_requested_partial_eva_layer():
     from projects.mmdet3d_plugin.models.temporal_memory import RepDetr3DAdapter
 
