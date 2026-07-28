@@ -348,6 +348,8 @@ class RepDetr3D(MVXTwoStageDetector):
             features,
             distill_losses=distill_losses,
             policy_losses=policy_losses)
+        self.temporal_memory_controller.memory = self._temporal_memory_detach_features(
+            getattr(self.temporal_memory_controller, 'memory', None))
         self._tm_train_step = getattr(self, '_tm_train_step', 0) + 1
         return features, losses
 
@@ -496,6 +498,9 @@ class RepDetr3D(MVXTwoStageDetector):
             features,
             distill_losses=distill_losses,
             policy_losses=policy_losses)
+        for state in getattr(self, '_tm_batch_states', []):
+            state['memory'] = self._temporal_memory_detach_features(
+                state.get('memory'))
         self._tm_train_step = getattr(self, '_tm_train_step', 0) + 1
         return features, losses
 
@@ -1093,6 +1098,22 @@ class RepDetr3D(MVXTwoStageDetector):
             feature.index_select(0, indices.to(feature.device))
             for feature in features
         ]
+
+    @staticmethod
+    def _temporal_memory_detach_features(features):
+        if features is None:
+            return None
+        if isinstance(features, list):
+            return [
+                feature.detach() if hasattr(feature, 'detach') else feature
+                for feature in features
+            ]
+        if isinstance(features, tuple):
+            return tuple(
+                feature.detach() if hasattr(feature, 'detach') else feature
+                for feature in features
+            )
+        return features.detach() if hasattr(features, 'detach') else features
 
     def _temporal_memory_ensure_batch_state(self, batch_size):
         states = getattr(self, '_tm_batch_states', None)

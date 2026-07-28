@@ -203,6 +203,106 @@ def test_repdetr3d_training_temporal_path_supports_mixed_batch_policy_actions():
     assert torch.allclose(features[0][:, 1].reshape(-1), torch.tensor([8.1, 16.6]))
 
 
+def test_repdetr3d_batched_training_detaches_cached_memory_between_iterations():
+    from projects.mmdet3d_plugin.models.detectors.repdetr3d import RepDetr3D
+    from projects.mmdet3d_plugin.models.temporal_memory import TemporalMemoryController
+
+    model = RepDetr3D.__new__(RepDetr3D)
+    model.temporal_memory_enabled = True
+    model.temporal_memory = {
+        "updater": "gated_residual",
+        "partial_layer": "block8",
+    }
+    model.tm_profiler = None
+    model.temporal_memory_projector = lambda features, layer_id=None, action=None: [features]
+    model.temporal_memory_controller = TemporalMemoryController(
+        enabled=True,
+        keyframe_interval=2,
+        updater="gated_residual",
+        updater_cfg=dict(channels=1),
+        policy=dict(type="fixed_interval", partial_action="L8"),
+    )
+    model.temporal_memory_controller.updater.residual_scale.data.fill_(1.0)
+    model._profile_extract_full_features = lambda frame_data, len_queue, training_mode: [
+        frame_data["img"].reshape(-1, 1, 1, 1, 1)
+    ]
+    model._profile_extract_partial_features = lambda frame_data, layer_id: (
+        frame_data["img"].reshape(-1, 1, 1, 1, 1) * 2.0
+    )
+
+    img = torch.tensor(
+        [[[1.0], [2.0]], [[3.0], [4.0]]],
+        requires_grad=True,
+    )
+    metas = [
+        [{"scene_token": "scene-a"}, {"scene_token": "scene-b"}],
+        [{"scene_token": "scene-a"}, {"scene_token": "scene-b"}],
+    ]
+
+    features, _ = model._extract_img_feat_temporal_memory_train(
+        metas,
+        img=img,
+        prev_exists=torch.ones(2, 2),
+    )
+    features[0].sum().backward()
+    for state in model._tm_batch_states:
+        assert not state["memory"][0].requires_grad
+
+    img2 = torch.tensor(
+        [[[5.0], [6.0]], [[7.0], [8.0]]],
+        requires_grad=True,
+    )
+    features2, _ = model._extract_img_feat_temporal_memory_train(
+        metas,
+        img=img2,
+        prev_exists=torch.ones(2, 2),
+    )
+    features2[0].sum().backward()
+
+    assert img2.grad is not None
+
+
+def test_repdetr3d_single_training_detaches_cached_memory_between_iterations():
+    from projects.mmdet3d_plugin.models.detectors.repdetr3d import RepDetr3D
+    from projects.mmdet3d_plugin.models.temporal_memory import TemporalMemoryController
+
+    model = RepDetr3D.__new__(RepDetr3D)
+    model.temporal_memory_enabled = True
+    model.temporal_memory = {
+        "updater": "reuse",
+        "partial_layer": "block8",
+    }
+    model.tm_profiler = None
+    model.temporal_memory_controller = TemporalMemoryController(
+        enabled=True,
+        keyframe_interval=1,
+        updater="reuse",
+    )
+    model._profile_extract_full_features = lambda frame_data, len_queue, training_mode: [
+        frame_data["img"].reshape(1, 1, 1, 1, 1)
+    ]
+
+    img = torch.tensor([[[1.0]]], requires_grad=True)
+    features, _ = model._extract_img_feat_temporal_memory_train(
+        [[{"scene_token": "scene-a"}]],
+        img=img,
+        prev_exists=torch.ones(1, 1),
+    )
+    features[0].sum().backward()
+
+    assert not model.temporal_memory_controller.memory[0].requires_grad
+
+    img2 = torch.tensor([[[2.0]]], requires_grad=True)
+    features2, _ = model._extract_img_feat_temporal_memory_train(
+        [[{"scene_token": "scene-a"}]],
+        img=img2,
+        prev_exists=torch.ones(1, 1),
+    )
+    features2[0].sum().backward()
+
+    assert img2.grad is not None
+
+
 def test_repdetr3d_training_temporal_path_keeps_distill_loss_key_without_non_keyframes():
     from projects.mmdet3d_plugin.models.detectors.repdetr3d import RepDetr3D
     from projects.mmdet3d_plugin.models.temporal_memory import TemporalMemoryController
