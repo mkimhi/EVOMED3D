@@ -6,6 +6,7 @@ from .partial_features import resolve_eva_layer_index
 from .policies import CycleFramePolicy, FixedIntervalFramePolicy, MlpFramePolicy, action_to_layer, build_frame_policy, layer_to_action
 from .profiling import TemporalMemoryProfiler
 from .projectors import LayeredPartialFeatureProjector, PartialFeatureProjector
+from .routers import DepthExitRouter, DepthRouteOutput, depth_router_losses
 from .controller import TemporalMemoryController
 from .updaters import AttentionMemoryUpdater, GatedResidualMemoryUpdater, LayeredMemoryUpdater, PartialOnlyUpdater, ReuseUpdater, build_memory_updater
 from .adapters.repdetr3d_adapter import RepDetr3DAdapter
@@ -15,6 +16,8 @@ __all__ = [
     'AttentionMemoryUpdater',
     'DetectorAdapter',
     'DistillationLoss',
+    'DepthExitRouter',
+    'DepthRouteOutput',
     'CycleFramePolicy',
     'FixedIntervalFramePolicy',
     'MlpFramePolicy',
@@ -33,6 +36,7 @@ __all__ = [
     'build_frame_policy',
     'build_detector_adapter',
     'build_memory_updater',
+    'depth_router_losses',
     'layer_to_action',
     'relative_ego_transform',
     'resolve_eva_layer_index',
