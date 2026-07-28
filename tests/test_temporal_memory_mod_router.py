@@ -59,7 +59,7 @@ class _FixedTokenRouter(nn.Module):
         return self.scores.expand(tokens.size(0), -1)
 
 
-def _make_block(window_size=0):
+def _make_block(window_size=0, is_local_window_attention=None):
     from projects.mmdet3d_plugin.models.backbones.eva_vit import Block
 
     return Block(
@@ -67,6 +67,7 @@ def _make_block(window_size=0):
         num_heads=2,
         mlp_ratio=1.0,
         window_size=window_size,
+        is_local_window_attention=is_local_window_attention,
         rope=None,
         flash_attn=False,
         with_cp=False,
@@ -109,6 +110,44 @@ def test_mod_rejects_window_attention_blocks():
         )
 
 
+def test_mod_routes_independently_inside_each_global_attention_window():
+    from projects.mmdet3d_plugin.models.temporal_memory.routers import TokenDepthAdapter
+
+    block = _make_block(window_size=2, is_local_window_attention=False).eval()
+    router = _FixedTokenRouter([
+        [0.0, 3.0, 1.0, 2.0],
+        [4.0, 1.0, 3.0, 2.0],
+    ])
+    x = torch.randn(1, 2, 4, 8)
+
+    output, stats = block.forward_mod(
+        x, router, TokenDepthAdapter(channels=8, hidden_channels=4), capacity_ratio=0.5
+    )
+    output_flat = output.reshape(1, 8, 8)
+    input_flat = x.reshape(1, 8, 8)
+
+    assert stats["selected_indices"].tolist() == [[1, 3], [0, 2]]
+    assert stats["windows_per_camera"] == 2
+    # Window partition order is [0, 1, 4, 5] then [2, 3, 6, 7].
+    assert torch.equal(output_flat[:, [0, 3, 4, 7]], input_flat[:, [0, 3, 4, 7]])
+    assert not torch.equal(output_flat[:, [1, 2, 5, 6]], input_flat[:, [1, 2, 5, 6]])
+
+
+def test_mod_routes_half_of_real_tokens_in_padded_global_window():
+    block = _make_block(window_size=20, is_local_window_attention=False).eval()
+    # A 20x50 camera feature creates three 20x20 windows. Give padding the
+    # highest scores to prove it cannot displace the real-token quota.
+    scores = torch.arange(3 * 400.0).reshape(3, 400)
+    router = _FixedTokenRouter(scores)
+    x = torch.randn(1, 20, 50, 8)
+
+    _, stats = block.forward_mod(x, router, adapter=None, capacity_ratio=0.5)
+
+    assert stats["selected_count"] == 200
+    assert stats["valid_token_count"].tolist() == [400, 400, 200]
+    assert stats["valid_selected_count"].tolist() == [200, 200, 100]
+
+
 def _make_eva():
     from projects.mmdet3d_plugin.models.backbones.eva_vit import EVAViT
 
@@ -120,7 +159,7 @@ def _make_eva():
         num_heads=2,
         mlp_ratio=1.0,
         window_size=2,
-        global_window_size=0,
+        global_window_size=2,
         window_block_indexes=tuple(
             index for index in range(24) if index not in (8, 11, 14, 17, 20, 23)
         ),

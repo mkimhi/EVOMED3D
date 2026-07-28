@@ -104,12 +104,14 @@ def depth_router_losses(output, target_cost=0.5, balance_prior=None, balance_wei
     }
 
 
-def select_topk_tokens(scores, capacity_ratio=0.5):
-    """Select a fixed token capacity independently for every camera.
+def select_topk_tokens(scores, capacity_ratio=0.5, valid_mask=None):
+    """Select a fixed token capacity independently for every packed group.
 
     Args:
-        scores (Tensor): Router scores with shape ``[B * N_cam, N_token]``.
+        scores (Tensor): Router scores with shape ``[N_group, N_token]``.
         capacity_ratio (float): Fraction of tokens sent through the routed block.
+        valid_mask (Tensor, optional): Boolean mask identifying real image
+            tokens in attention windows that contain spatial padding.
 
     Returns:
         tuple: Selected flat token indices ``[B * N_cam, K]`` and a dense
@@ -123,7 +125,24 @@ def select_topk_tokens(scores, capacity_ratio=0.5):
         raise ValueError('token router cannot select from an empty sequence')
 
     capacity = int(math.ceil(scores.size(1) * float(capacity_ratio)))
-    indices = scores.topk(capacity, dim=-1, largest=True, sorted=True).indices
+    if valid_mask is None:
+        indices = scores.topk(capacity, dim=-1, largest=True, sorted=True).indices
+    else:
+        if valid_mask.shape != scores.shape or valid_mask.dtype != torch.bool:
+            raise ValueError('valid_mask must be boolean with the same shape as scores')
+        valid_counts = valid_mask.sum(dim=-1)
+        valid_capacity = torch.ceil(valid_counts.to(torch.float32) * float(capacity_ratio)).long()
+        masked_scores = scores.masked_fill(~valid_mask, torch.finfo(scores.dtype).min)
+        valid_indices = masked_scores.topk(
+            capacity, dim=-1, largest=True, sorted=True
+        ).indices
+        invalid_indices = (~valid_mask).to(scores.dtype).topk(
+            capacity, dim=-1, largest=True, sorted=False
+        ).indices
+        packed_slots = torch.arange(capacity, device=scores.device).unsqueeze(0)
+        indices = torch.where(
+            packed_slots < valid_capacity.unsqueeze(1), valid_indices, invalid_indices
+        )
     mask = torch.zeros_like(scores, dtype=torch.bool)
     mask.scatter_(1, indices, True)
     return indices, mask
