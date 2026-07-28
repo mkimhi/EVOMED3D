@@ -241,6 +241,10 @@ class RepDetr3D(MVXTwoStageDetector):
         return adapter.extract_partial_features(self, data, layer_id)
 
     def _extract_img_feat_temporal_memory_train(self, img_metas, policy_annotation_data=None, **data):
+        if self._temporal_memory_batch_size_from_data(data) > 1:
+            return self._extract_img_feat_temporal_memory_train_batched(
+                img_metas, policy_annotation_data=policy_annotation_data, **data)
+
         frame_features = []
         distill_losses = []
         policy_losses = []
@@ -335,6 +339,154 @@ class RepDetr3D(MVXTwoStageDetector):
                 self._tm_previous_full_teacher = [
                     feature.detach() for feature in policy_teacher
                 ]
+
+        features = [
+            torch.stack([frame[level] for frame in frame_features], dim=1)
+            for level in range(len(frame_features[0]))
+        ]
+        losses = self._temporal_memory_aux_losses(
+            features,
+            distill_losses=distill_losses,
+            policy_losses=policy_losses)
+        self._tm_train_step = getattr(self, '_tm_train_step', 0) + 1
+        return features, losses
+
+    def _extract_img_feat_temporal_memory_train_batched(self, img_metas, policy_annotation_data=None, **data):
+        frame_features = []
+        distill_losses = []
+        policy_losses = []
+        batch_size = self._temporal_memory_batch_size_from_data(data)
+        self._temporal_memory_ensure_batch_state(batch_size)
+        T = data['img'].size(1)
+        policy_annotation_data = policy_annotation_data or {}
+        for i in range(T):
+            frame_data = dict(data)
+            frame_data['img'] = data['img'][:, i]
+            for key, value in policy_annotation_data.items():
+                frame_data[key] = self._tm_temporal_index(value, i)
+            frame_metas = img_metas[i]
+            prev_exists = data.get('prev_exists', None)
+            if prev_exists is not None:
+                prev_exists = prev_exists[:, i]
+
+            actions = []
+            is_reset_frames = []
+            policy_features = []
+            for batch_index in range(batch_size):
+                sample_meta = frame_metas[batch_index] if batch_index < len(frame_metas) else {}
+                sample_scene = sample_meta.get('scene_token') if isinstance(sample_meta, dict) else None
+                indices = torch.as_tensor([batch_index], dtype=torch.long)
+                sample_data = self._temporal_memory_slice_batch_data(frame_data, indices)
+                features = self._temporal_memory_policy_features(
+                    [sample_meta],
+                    sample_data,
+                    scene_token=sample_scene)
+                policy_features.append(features)
+                state = self._tm_batch_states[batch_index]
+                prev_ok = self._temporal_memory_sample_prev_exists(prev_exists, batch_index)
+                is_reset_frame = (
+                    state.get('scene_token') != sample_scene
+                    or not prev_ok
+                    or state.get('memory') is None
+                )
+                is_reset_frames.append(is_reset_frame)
+                if is_reset_frame or self._temporal_memory_sample_force_full_for_age(state):
+                    action = 'L24'
+                else:
+                    action = self.temporal_memory_controller.policy.decide(
+                        frame_index=state.get('frame_index', 0),
+                        has_memory=state.get('memory') is not None,
+                        is_reset_frame=False,
+                        scene_token=sample_scene,
+                        prev_exists=prev_ok,
+                        policy_features=features)
+                actions.append(action)
+
+            policy_teacher = None
+            if (
+                self._temporal_memory_policy_supervision_active()
+                or getattr(self.temporal_memory_controller, 'train_with_teacher', False)
+            ):
+                with torch.no_grad():
+                    policy_teacher = self._squeeze_temporal_feature_dim(
+                        self._profile_extract_full_features(
+                            frame_data, len_queue=1, training_mode=True))
+            if self._temporal_memory_policy_supervision_active() and policy_teacher is not None:
+                previous_teachers = getattr(self, '_tm_batch_previous_full_teacher', None)
+                if previous_teachers is None or len(previous_teachers) != batch_size:
+                    previous_teachers = [None for _ in range(batch_size)]
+                for batch_index in range(batch_size):
+                    previous_teacher = previous_teachers[batch_index]
+                    if previous_teacher is None or is_reset_frames[batch_index]:
+                        continue
+                    current_teacher = self._temporal_memory_select_feature_batch(
+                        policy_teacher,
+                        torch.as_tensor([batch_index], dtype=torch.long))
+                    policy_loss = self._temporal_memory_policy_supervision_loss(
+                        policy_features[batch_index],
+                        previous_teacher,
+                        current_teacher)
+                    if policy_loss is not None:
+                        policy_losses.append(policy_loss)
+
+            output_groups = []
+            full_indices = torch.as_tensor(
+                [index for index, action in enumerate(actions) if action == 'L24'],
+                dtype=torch.long)
+            if full_indices.numel() > 0:
+                full_data = self._temporal_memory_slice_batch_data(frame_data, full_indices)
+                full_features = self._squeeze_temporal_feature_dim(
+                    self._profile_extract_full_features(
+                        full_data, len_queue=1, training_mode=True))
+                output_groups.append((full_indices, full_features))
+
+            partial_current = self._temporal_memory_project_mixed_batch_partials(frame_data, actions)
+            for action in ('L8', 'L12', 'L16'):
+                indices = torch.as_tensor(
+                    [index for index, value in enumerate(actions) if value == action],
+                    dtype=torch.long)
+                if indices.numel() == 0:
+                    continue
+                previous = self._temporal_memory_gather_sample_memories(indices)
+                partial = self._temporal_memory_select_feature_batch(partial_current, indices)
+                updated = self.temporal_memory_controller._call_updater(
+                    previous,
+                    partial_current=partial,
+                    action=action)
+                output_groups.append((indices, updated))
+
+            output = self._temporal_memory_scatter_feature_group_list(output_groups, batch_size)
+            if (
+                policy_teacher is not None
+                and getattr(self.temporal_memory_controller, 'train_with_teacher', False)
+            ):
+                distill_losses.append(self.temporal_memory_controller.distillation_loss(
+                    output,
+                    policy_teacher))
+            frame_features.append(output)
+            current_teachers = []
+            for batch_index, action in enumerate(actions):
+                sample_meta = frame_metas[batch_index] if batch_index < len(frame_metas) else {}
+                sample_scene = sample_meta.get('scene_token') if isinstance(sample_meta, dict) else None
+                state = self._tm_batch_states[batch_index]
+                state['scene_token'] = sample_scene
+                state['memory'] = self._temporal_memory_select_feature_batch(
+                    output,
+                    torch.as_tensor([batch_index], dtype=torch.long))
+                state['frame_index'] = int(state.get('frame_index', 0)) + 1
+                state['frames_since_full'] = 0 if action == 'L24' else int(state.get('frames_since_full', 0)) + 1
+                self.temporal_memory_controller._policy_stats[action] = (
+                    self.temporal_memory_controller._policy_stats.get(action, 0) + 1)
+                self._temporal_memory_commit_policy_state(policy_features[batch_index])
+                if policy_teacher is not None:
+                    current_teachers.append([
+                        feature.detach()
+                        for feature in self._temporal_memory_select_feature_batch(
+                            policy_teacher,
+                            torch.as_tensor([batch_index], dtype=torch.long))
+                    ])
+            if current_teachers:
+                self._tm_batch_previous_full_teacher = current_teachers
 
         features = [
             torch.stack([frame[level] for frame in frame_features], dim=1)
@@ -909,6 +1061,135 @@ class RepDetr3D(MVXTwoStageDetector):
         if 'action' in signature.parameters:
             kwargs['action'] = action
         return projector(partial_features, **kwargs)
+
+    @staticmethod
+    def _temporal_memory_batch_size_from_data(data):
+        img = data.get('img', None)
+        if torch.is_tensor(img) and img.dim() > 0:
+            return int(img.size(0))
+        return 1
+
+    @staticmethod
+    def _temporal_memory_slice_batch_value(value, indices):
+        if torch.is_tensor(value) and value.dim() > 0 and value.size(0) >= int(indices.max().item()) + 1:
+            return value.index_select(0, indices.to(value.device))
+        if isinstance(value, list) and len(value) >= int(indices.max().item()) + 1:
+            return [value[int(index)] for index in indices.cpu().tolist()]
+        if isinstance(value, tuple) and len(value) >= int(indices.max().item()) + 1:
+            return tuple(value[int(index)] for index in indices.cpu().tolist())
+        return value
+
+    def _temporal_memory_slice_batch_data(self, data, indices):
+        return {
+            key: self._temporal_memory_slice_batch_value(value, indices)
+            for key, value in data.items()
+        }
+
+    @staticmethod
+    def _temporal_memory_select_feature_batch(features, indices):
+        if features is None:
+            return None
+        return [
+            feature.index_select(0, indices.to(feature.device))
+            for feature in features
+        ]
+
+    def _temporal_memory_ensure_batch_state(self, batch_size):
+        states = getattr(self, '_tm_batch_states', None)
+        if states is not None and len(states) == batch_size:
+            return
+        self._tm_batch_states = [
+            dict(scene_token=None, memory=None, frame_index=0, frames_since_full=0)
+            for _ in range(batch_size)
+        ]
+
+    def _temporal_memory_gather_sample_memories(self, indices):
+        memories = []
+        for index in indices.cpu().tolist():
+            memory = self._tm_batch_states[int(index)].get('memory')
+            if memory is None:
+                raise RuntimeError('temporal memory sample is missing previous memory')
+            memories.append(memory)
+        return [
+            torch.cat([memory[level] for memory in memories], dim=0)
+            for level in range(len(memories[0]))
+        ]
+
+    @staticmethod
+    def _temporal_memory_sample_prev_exists(prev_exists, batch_index):
+        if prev_exists is None:
+            return True
+        if torch.is_tensor(prev_exists):
+            if prev_exists.numel() == 0:
+                return True
+            if prev_exists.numel() == 1:
+                return bool(prev_exists.detach().bool().item())
+            return bool(prev_exists.reshape(-1)[batch_index].detach().bool().item())
+        if isinstance(prev_exists, (list, tuple)):
+            if len(prev_exists) == 0:
+                return True
+            value = prev_exists[min(batch_index, len(prev_exists) - 1)]
+            return RepDetr3D._temporal_memory_sample_prev_exists(value, 0)
+        return bool(prev_exists)
+
+    def _temporal_memory_sample_force_full_for_age(self, state):
+        max_frames = getattr(self.temporal_memory_controller, 'max_frames_between_full', None)
+        if max_frames is None:
+            return False
+        return int(state.get('frames_since_full', 0)) >= max(int(max_frames) - 1, 0)
+
+    @staticmethod
+    def _temporal_memory_scatter_feature_batches(group_outputs, batch_size):
+        if not group_outputs:
+            return None
+        first_features = next(iter(group_outputs.values()))
+        merged = []
+        for level, reference in enumerate(first_features):
+            pieces = []
+            for indices, features in group_outputs.items():
+                feature = features[level]
+                full = feature.new_zeros((batch_size,) + tuple(feature.shape[1:]))
+                full.index_copy_(0, indices.to(feature.device), feature)
+                pieces.append(full)
+            merged.append(sum(pieces))
+        return merged
+
+    @staticmethod
+    def _temporal_memory_scatter_feature_group_list(output_groups, batch_size):
+        if not output_groups:
+            return None
+        merged = []
+        for level in range(len(output_groups[0][1])):
+            pieces = []
+            for indices, features in output_groups:
+                feature = features[level]
+                full = feature.new_zeros((batch_size,) + tuple(feature.shape[1:]))
+                full.index_copy_(0, indices.to(feature.device), feature)
+                pieces.append(full)
+            merged.append(sum(pieces))
+        return merged
+
+    def _temporal_memory_project_mixed_batch_partials(self, frame_data, actions):
+        batch_size = self._temporal_memory_batch_size_from_data(frame_data)
+        grouped_outputs = {}
+        for action in ('L8', 'L12', 'L16'):
+            indices = torch.as_tensor(
+                [index for index, value in enumerate(actions) if value == action],
+                dtype=torch.long)
+            if indices.numel() == 0:
+                continue
+            layer_id = self._temporal_memory_action_layer(action)
+            group_data = self._temporal_memory_slice_batch_data(frame_data, indices)
+            partial_features = self._profile_extract_partial_features(group_data, layer_id)
+            grouped_outputs[tuple(indices.tolist())] = self._project_temporal_memory_partial(
+                partial_features,
+                layer_id=layer_id,
+                action=action)
+        keyed_outputs = {
+            torch.as_tensor(indices, dtype=torch.long): features
+            for indices, features in grouped_outputs.items()
+        }
+        return self._temporal_memory_scatter_feature_batches(keyed_outputs, batch_size)
 
     @staticmethod
     def _squeeze_temporal_feature_dim(features):

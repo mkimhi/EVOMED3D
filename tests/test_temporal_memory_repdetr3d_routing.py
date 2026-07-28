@@ -104,6 +104,105 @@ def test_repdetr3d_training_temporal_path_stacks_features_and_distill_loss():
     assert partial1[0].grad is not None
 
 
+def test_repdetr3d_projects_mixed_batch_policy_actions_by_sample():
+    from projects.mmdet3d_plugin.models.detectors.repdetr3d import RepDetr3D
+
+    model = RepDetr3D.__new__(RepDetr3D)
+    calls = []
+
+    def partial(frame_data, layer_id):
+        calls.append(("extract", layer_id, tuple(frame_data["img"].tolist())))
+        if layer_id == "block8":
+            return torch.tensor([[[[[8.0]]]]])
+        if layer_id == "block16":
+            return torch.tensor([[[[[16.0]]]]])
+        raise AssertionError(layer_id)
+
+    class Projector:
+        def __call__(self, features, layer_id=None, action=None):
+            calls.append(("project", layer_id, action, tuple(features.reshape(-1).tolist())))
+            offset = {"L8": 0.1, "L16": 0.6}[action]
+            return [features + offset]
+
+    model._profile_extract_partial_features = partial
+    model.temporal_memory_projector = Projector()
+
+    merged = model._temporal_memory_project_mixed_batch_partials(
+        {"img": torch.tensor([10.0, 20.0])},
+        ["L8", "L16"],
+    )
+
+    assert calls == [
+        ("extract", "block8", (10.0,)),
+        ("project", "block8", "L8", (8.0,)),
+        ("extract", "block16", (20.0,)),
+        ("project", "block16", "L16", (16.0,)),
+    ]
+    assert torch.allclose(merged[0].reshape(-1), torch.tensor([8.1, 16.6]))
+
+
+def test_repdetr3d_training_temporal_path_supports_mixed_batch_policy_actions():
+    from projects.mmdet3d_plugin.models.detectors.repdetr3d import RepDetr3D
+    from projects.mmdet3d_plugin.models.temporal_memory import TemporalMemoryController
+
+    class MetaActionPolicy:
+        def decide(self, frame_index, has_memory, is_reset_frame=False, policy_features=None, **kwargs):
+            if is_reset_frame or not has_memory:
+                return "L24"
+            return policy_features["desired_action"]
+
+        __call__ = decide
+
+    class Projector:
+        def __call__(self, features, layer_id=None, action=None):
+            return [features + {"L8": 0.1, "L16": 0.6}[action]]
+
+    model = RepDetr3D.__new__(RepDetr3D)
+    model.temporal_memory_enabled = True
+    model.temporal_memory = {
+        "updater": "partial_only",
+        "partial_layer": "block8",
+    }
+    model.tm_profiler = None
+    model.temporal_memory_projector = Projector()
+    model.temporal_memory_controller = TemporalMemoryController(
+        enabled=True,
+        keyframe_interval=2,
+        updater="partial_only",
+        policy=MetaActionPolicy(),
+    )
+    model._profile_extract_full_features = lambda frame_data, len_queue, training_mode: [
+        frame_data["img"].reshape(-1, 1, 1, 1, 1) + 100.0
+    ]
+
+    def partial(frame_data, layer_id):
+        value = {"block8": 8.0, "block16": 16.0}[layer_id]
+        return torch.full((frame_data["img"].size(0), 1, 1, 1, 1), value)
+
+    model._profile_extract_partial_features = partial
+    model._temporal_memory_policy_features = lambda img_metas, data, scene_token=None: {
+        "desired_action": img_metas[0]["desired_action"],
+        "_state": {"scene_token": scene_token, "is_scene_start": False},
+    }
+
+    features, _ = model._extract_img_feat_temporal_memory_train(
+        [
+            [
+                {"scene_token": "scene-a", "desired_action": "L24"},
+                {"scene_token": "scene-b", "desired_action": "L24"},
+            ],
+            [
+                {"scene_token": "scene-a", "desired_action": "L8"},
+                {"scene_token": "scene-b", "desired_action": "L16"},
+            ],
+        ],
+        img=torch.tensor([[[0.0], [10.0]], [[0.0], [20.0]]]),
+        prev_exists=torch.ones(2, 2),
+    )
+
+    assert torch.allclose(features[0][:, 1].reshape(-1), torch.tensor([8.1, 16.6]))
+
+
 def test_repdetr3d_training_temporal_path_keeps_distill_loss_key_without_non_keyframes():
     from projects.mmdet3d_plugin.models.detectors.repdetr3d import RepDetr3D
     from projects.mmdet3d_plugin.models.temporal_memory import TemporalMemoryController
