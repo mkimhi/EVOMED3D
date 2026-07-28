@@ -219,7 +219,6 @@ class TemporalMemoryController:
                 action = 'L24'
             if action == 'L24':
                 output = request['extract_full']()
-                state['memory'] = output
                 state['frames_since_full'] = 0
             else:
                 output = self._call_updater(
@@ -228,8 +227,11 @@ class TemporalMemoryController:
                     ego_motion_embedding=request.get('ego_motion_embedding'),
                     action=action,
                 )
-                state['memory'] = output
                 state['frames_since_full'] += 1
+            # The cache survives minibatches, whereas an autograd graph does
+            # not.  Keep the current output connected to its detection loss,
+            # but truncate history before it can be read by another frame.
+            state['memory'] = self._detach_memory(output) if training else output
             state['frame_index'] += 1
             self.last_action = action
             self.last_action_forced = forced
@@ -238,3 +240,16 @@ class TemporalMemoryController:
                 self._policy_stats['forced_l24'] = self._policy_stats.get('forced_l24', 0) + 1
             outputs.append(output)
         return outputs
+
+    @staticmethod
+    def _detach_memory(memory):
+        if torch.is_tensor(memory):
+            return memory.detach()
+        if isinstance(memory, tuple):
+            return tuple(TemporalMemoryController._detach_memory(value) for value in memory)
+        if isinstance(memory, list):
+            return [TemporalMemoryController._detach_memory(value) for value in memory]
+        if isinstance(memory, dict):
+            return {key: TemporalMemoryController._detach_memory(value)
+                    for key, value in memory.items()}
+        return memory

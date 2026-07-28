@@ -412,3 +412,17 @@ def test_controller_keeps_memory_state_separate_for_batched_sample_requests():
 
     assert [value.item() for value in first] == [1.0, 2.0]
     assert [value.item() for value in second] == [3.0, 4.0]
+
+
+def test_sample_controller_detaches_training_cache_but_not_current_output():
+    import torch
+    from projects.mmdet3d_plugin.models.temporal_memory import TemporalMemoryController
+
+    controller = TemporalMemoryController(enabled=True, updater="partial_only")
+    feature = torch.ones(1, requires_grad=True)
+    output = controller.get_or_update_samples([
+        dict(sample_key="a", scene_token="scene-a", action="L24", extract_full=lambda: [feature]),
+    ], training=True)[0]
+
+    assert output[0].requires_grad
+    assert not controller.states["a"]["memory"][0].requires_grad
