@@ -997,18 +997,30 @@ class EVAViT(nn.Module):
             for m in self.parameters():
                 m.requires_grad = False
             
-    def _forward_blocks(self, x, stop_at=None):
+    def prepare_tokens(self, x):
         x = self.patch_embed(x)
         if self.pos_embed is not None:
             x = x + get_abs_pos(
                 self.pos_embed, self.pretrain_use_cls_token, (x.shape[1], x.shape[2])
             )
-
-        for index, blk in enumerate(self.blocks):
-            x = blk(x)   # b, h, w, c
-            if stop_at is not None and index == stop_at:
-                return x
         return x
+
+    def forward_blocks(self, x, start_index=0, stop_at=None):
+        if start_index < 0 or start_index >= len(self.blocks):
+            raise ValueError(f'start_index must be in [0, {len(self.blocks) - 1}], got {start_index}')
+        if stop_at is None:
+            stop_at = len(self.blocks) - 1
+        if stop_at < start_index or stop_at >= len(self.blocks):
+            raise ValueError(f'stop_at must be in [{start_index}, {len(self.blocks) - 1}], got {stop_at}')
+
+        for index in range(start_index, stop_at + 1):
+            blk = self.blocks[index]
+            x = blk(x)   # b, h, w, c
+        return x
+
+    def _forward_blocks(self, x, stop_at=None):
+        x = self.prepare_tokens(x)
+        return self.forward_blocks(x, start_index=0, stop_at=stop_at)
 
     def forward_intermediate(self, x, layer_index):
         if layer_index < 0 or layer_index >= len(self.blocks):
