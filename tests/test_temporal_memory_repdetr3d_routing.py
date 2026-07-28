@@ -49,6 +49,27 @@ def test_repdetr3d_non_reuse_temporal_path_projects_partial_features():
     assert model.temporal_memory_controller.kwargs["prev_exists"] is True
 
 
+def test_repdetr3d_depth_router_metadata_is_per_sample_and_rejects_gt_keys():
+    import pytest
+    from projects.mmdet3d_plugin.models.detectors.repdetr3d import RepDetr3D
+
+    model = RepDetr3D.__new__(RepDetr3D)
+    model.temporal_memory = dict(router=dict(feature_names=("speed", "age")))
+
+    metadata = model._tm_depth_router_metadata_tensor([
+        {"speed": 1.0, "age": 2.0},
+        {"speed": 3.0, "age": 4.0},
+    ], device=torch.device("cpu"), dtype=torch.float32)
+
+    assert metadata.tolist() == [[1.0, 2.0], [3.0, 4.0]]
+    with pytest.raises(ValueError, match="online-only"):
+        model._tm_depth_router_metadata_tensor(
+            [{"speed": 1.0, "gt_bboxes_3d": 1.0}],
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+
+
 def test_repdetr3d_training_temporal_path_stacks_features_and_distill_loss():
     from projects.mmdet3d_plugin.models.detectors.repdetr3d import RepDetr3D
     from projects.mmdet3d_plugin.models.temporal_memory import TemporalMemoryController
