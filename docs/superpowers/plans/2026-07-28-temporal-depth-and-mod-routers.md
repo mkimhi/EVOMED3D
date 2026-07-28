@@ -15,7 +15,7 @@
 - Router evaluation/test sets `data.samples_per_gpu=1`; training batch size remains inherited from the base config.
 - Router inputs are online-only L8, cached memory, timestamp/frame age, and ego metadata. No GT, annotations, offline data, or drift target is allowed.
 - Depth costs are `[8,12,16,24]/24`, target cost is `0.50`, and reset-5 forces L24. Router loss is detection plus cost/balance loss only.
-- L8 retains the existing projector/updater, L24 retains the existing full path, and only L12/L16 get exit adapters.
+- L8/L12/L16 retain the existing layer-specific projectors/updaters and L24 retains the existing full path; the depth router adds no exit adapters.
 - MoD capacity is exactly 50% per camera at global blocks `(9,12,15,18,21)`; top-k, pack/scatter, adapters, and router overhead are part of latency.
 
 ---
@@ -32,7 +32,6 @@
 **Interfaces:**
 - `DepthExitRouter(feature_dim, metadata_dim, hidden_dim)` returns `DepthRouteOutput(logits, probabilities, hard_actions[B], hard_one_hot[B,4], expected_cost)`.
 - `depth_router_losses(route, target_cost, balance_prior, balance_weight)` returns `loss_tm_budget`, `loss_tm_balance`, and expected cost.
-- `DepthExitAdapter(channels, hidden_channels)` is shape preserving `[B,N,C,H,W]`.
 - `TemporalMemoryController.get_or_update_samples(requests, training=False)` owns `states[sample_key]` with independent `scene_token`, `frame_index`, `frames_since_full`, and memory.
 
 - [ ] **Step 1: Write failing tests**
@@ -60,7 +59,7 @@ Run `conda run --no-capture-output -n token pytest tests/test_temporal_memory_ro
 
 - [ ] **Step 3: Implement**
 
-Pool cameras/spatial tokens, project current and previous vectors, concatenate metadata, and use hard Gumbel-Softmax in training/argmax in evaluation. Expected cost uses soft probabilities; budget is squared target error; balance is batch-mean probability error and decays to zero. Do not calculate similarity, drift, GT, or classification-target loss. Use zero-initialized residual adapters only for L12/L16. Refactor controller state so single-sample APIs wrap per-sample state; enforce reset-5 before honoring a partial request.
+Pool cameras/spatial tokens, project current and previous vectors, concatenate metadata, and use hard Gumbel-Softmax in training/argmax in evaluation. Expected cost uses soft probabilities; budget is squared target error; balance is batch-mean probability error and decays to zero. Do not calculate similarity, drift, GT, or classification-target loss. Refactor controller state so single-sample APIs wrap per-sample state; enforce reset-5 before honoring a partial request.
 
 - [ ] **Step 4: Verify and commit**
 
@@ -104,7 +103,7 @@ Run `conda run --no-capture-output -n token pytest tests/test_temporal_memory_pa
 
 - [ ] **Step 3: Implement**
 
-Move patch/absolute-position setup into `prepare_tokens`; retain `_forward_blocks` as a backward-compatible wrapper. Map L8/L12/L16 to stops 7/11/15. In RepDETR3D, extract L8 for all B samples, build metadata exclusively from online scalar keys, look up cache states, route, execute equal-depth groups, adapt/project L12/L16 only, and scatter results. L24 bypasses adapters/projectors and uses the original full path. Add `freeze_backbone_only=True` that freezes only EVA while head/router/adapters/projector/updater stay trainable; preserve existing `freeze_pretrained_detector` behavior. Return budget every iteration and a graph-connected zero balance loss after warm-up.
+Move patch/absolute-position setup into `prepare_tokens`; retain `_forward_blocks` as a backward-compatible wrapper. Map L8/L12/L16 to stops 7/11/15. In RepDETR3D, extract L8 for all B samples, build metadata exclusively from online scalar keys, look up cache states, route, execute equal-depth groups, select the existing layer-specific partial projector by action, and scatter results. L24 bypasses projectors and uses the original full path. Add `freeze_backbone_only=True` that freezes only EVA while head/router/projector/updater stay trainable; preserve existing `freeze_pretrained_detector` behavior. Return budget every iteration and a graph-connected zero balance loss after warm-up.
 
 - [ ] **Step 4: Verify and commit**
 
@@ -155,7 +154,6 @@ Run `conda run --no-capture-output -n token pytest tests/test_temporal_memory_mo
 
 **Files:**
 - Create: `projects/configs/RepDETR3D/repdetr3d_eva02_800_bs2_seq_24e_tm_depth_router_budget50_reset5.py`
-- Create: `projects/configs/RepDETR3D/repdetr3d_eva02_800_bs2_seq_24e_tm_depth_router_budget50_reset5_adapter_warmup.py`
 - Create: `projects/configs/RepDETR3D/repdetr3d_eva02_800_bs2_seq_24e_tm_mod_global50_frozen.py`
 - Create: `projects/configs/RepDETR3D/repdetr3d_eva02_800_bs2_seq_24e_tm_mod_global50_frozen_adapter_warmup.py`
 - Create: `projects/configs/RepDETR3D/repdetr3d_eva02_800_bs2_seq_24e_tm_mod_global50_joint.py`
@@ -185,7 +183,7 @@ Run `conda run --no-capture-output -n token pytest tests/test_temporal_memory_co
 
 - [ ] **Step 3: Implement configs and docs**
 
-All configs load `./ckpts/repdetr3d_eva02_800_bs4_seq_24e.pth`, set reset-5, online-only input names, and `router_eval_cfg.data.samples_per_gpu=1`. Depth configs use target .50 and L12/L16-only optional adapter warm-up. MoD configs use global blocks `(9,12,15,18,21)`, capacity .50, frozen/no-warm-up, frozen/warm-up, and joint N-vium-style warm-up variants. Append five blank-metric `RESULTS.md` rows stating no GT/no drift target, unbatched evaluation, and exact commands ending `--cfg-options data.samples_per_gpu=1 model.tm_debug_latency=True`.
+All configs load `./ckpts/repdetr3d_eva02_800_bs4_seq_24e.pth`, set reset-5, online-only input names, and `router_eval_cfg.data.samples_per_gpu=1`. The depth router uses target .50 with the existing L8/L12/L16 projectors and no exit-adapter warm-up. MoD configs use global blocks `(9,12,15,18,21)`, capacity .50, frozen/no-warm-up, frozen/warm-up, and joint N-vium-style warm-up variants. Append five blank-metric `RESULTS.md` rows stating no GT/no drift target, unbatched evaluation, and exact commands ending `--cfg-options data.samples_per_gpu=1 model.tm_debug_latency=True`.
 
 - [ ] **Step 4: Verify and commit**
 
@@ -214,6 +212,6 @@ Run one GPU training iteration of the primary depth and frozen-MoD configs with 
 
 ## Plan Self-Review
 
-- Tasks 1--2 cover per-sample cache, depth routes, online-only inputs, reset-5, unmodified L8/L24, L12/L16 adapters, and detection-plus-budget training.
+- Tasks 1--2 cover per-sample cache, depth routes, online-only inputs, reset-5, the existing L8/L12/L16 projectors, and detection-plus-budget training.
 - Task 3 covers exact 50% token MoD only where EVA uses global attention; external config indices `(9,12,15,18,21)` map to internal `(8,11,14,17,20)`.
 - Tasks 4--5 cover frozen versus joint experiments, requested result rows, single-sample evaluation, baseline checks, and bounded GPU verification.
