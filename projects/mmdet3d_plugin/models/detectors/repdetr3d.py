@@ -897,6 +897,17 @@ class RepDetr3D(MVXTwoStageDetector):
             return self.temporal_memory.get('partial_layer', 'middle')
         return f'block{layer}'
 
+    def _tm_depth_router_metadata_tensor(self, feature_rows, device, dtype):
+        router_cfg = self.temporal_memory.get('router', {}) or {}
+        feature_names = tuple(router_cfg.get('feature_names', ()))
+        forbidden = {'gt_bboxes_3d', 'gt_labels_3d', 'num_annotations'}
+        values = []
+        for row in feature_rows:
+            if any(name in row for name in forbidden):
+                raise ValueError('depth router accepts online-only metadata')
+            values.append([float(row.get(name, 0.0) or 0.0) for name in feature_names])
+        return torch.as_tensor(values, device=device, dtype=dtype)
+
     def _project_temporal_memory_partial(self, partial_features, layer_id=None, action=None):
         projector = self.temporal_memory_projector
         try:
