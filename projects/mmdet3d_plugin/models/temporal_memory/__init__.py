@@ -7,6 +7,7 @@ from .policies import CycleFramePolicy, FixedIntervalFramePolicy, MlpFramePolicy
 from .policy_targets import CounterfactualActionTargets
 from .profiling import TemporalMemoryProfiler
 from .projectors import LayeredPartialFeatureProjector, PartialFeatureProjector
+from .routers import DepthExitRouter, DepthRouteOutput, depth_router_losses
 from .controller import TemporalMemoryController
 from .updaters import AttentionMemoryUpdater, GatedResidualMemoryUpdater, LayeredMemoryUpdater, PartialOnlyUpdater, ReuseUpdater, build_memory_updater
 from .adapters.repdetr3d_adapter import RepDetr3DAdapter
@@ -16,6 +17,8 @@ __all__ = [
     'AttentionMemoryUpdater',
     'DetectorAdapter',
     'DistillationLoss',
+    'DepthExitRouter',
+    'DepthRouteOutput',
     'CycleFramePolicy',
     'CounterfactualActionTargets',
     'FixedIntervalFramePolicy',
@@ -35,6 +38,7 @@ __all__ = [
     'build_frame_policy',
     'build_detector_adapter',
     'build_memory_updater',
+    'depth_router_losses',
     'layer_to_action',
     'relative_ego_transform',
     'resolve_eva_layer_index',
