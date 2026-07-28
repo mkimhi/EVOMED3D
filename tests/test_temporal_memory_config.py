@@ -178,3 +178,49 @@ def test_repdetr3d_temporal_memory_trainable_updater_configs_keep_checkpoint_saf
         namespace = {}
         exec((ROOT / "projects/configs/RepDETR3D" / filename).read_text(), namespace)
         assert namespace.get("find_unused_parameters", False) is False, filename
+
+
+def test_depth_router_config_is_online_only_reset5_and_single_sample_eval():
+    filename = "repdetr3d_eva02_800_bs2_seq_24e_tm_depth_router_budget50_reset5.py"
+    config = ROOT / "projects/configs/RepDETR3D" / filename
+    assert config.exists(), filename
+
+    namespace = {}
+    exec(config.read_text(), namespace)
+    temporal_memory = namespace["model"]["temporal_memory"]
+    router = temporal_memory["router"]
+
+    assert temporal_memory["max_frames_between_full"] == 5
+    assert temporal_memory["keyframe_interval"] == 5
+    assert temporal_memory["partial_layers"] == (8, 12, 16)
+    assert router["type"] == "depth_exit"
+    assert router["actions"] == ("L8", "L12", "L16", "L24")
+    assert router["target_cost"] == 0.5
+    assert all("gt" not in name.lower() for name in router["feature_names"])
+    assert all("drift" not in name.lower() for name in router["feature_names"])
+    assert namespace["router_eval_cfg"]["data"]["samples_per_gpu"] == 1
+
+
+def test_mod_configs_use_global_half_capacity_and_differ_by_training_regime():
+    filenames = {
+        "frozen": "repdetr3d_eva02_800_bs2_seq_24e_tm_mod_global50_frozen.py",
+        "warmup": "repdetr3d_eva02_800_bs2_seq_24e_tm_mod_global50_frozen_adapter_warmup.py",
+        "joint": "repdetr3d_eva02_800_bs2_seq_24e_tm_mod_global50_joint.py",
+    }
+    configs = {}
+    for name, filename in filenames.items():
+        path = ROOT / "projects/configs/RepDETR3D" / filename
+        assert path.exists(), filename
+        namespace = {}
+        exec(path.read_text(), namespace)
+        configs[name] = namespace
+
+        mod_router = namespace["model"]["temporal_memory"]["mod_router"]
+        assert mod_router["routed_blocks"] == (9, 12, 15, 18, 21)
+        assert mod_router["capacity_ratio"] == 0.5
+        assert namespace["router_eval_cfg"]["data"]["samples_per_gpu"] == 1
+
+    assert configs["frozen"]["model"]["temporal_memory"]["mod_router"]["train_backbone"] is False
+    assert configs["warmup"]["model"]["temporal_memory"]["mod_router"]["train_backbone"] is False
+    assert configs["warmup"]["model"]["temporal_memory"]["mod_router"]["adapter_warmup_only"] is True
+    assert configs["joint"]["model"]["temporal_memory"]["mod_router"]["train_backbone"] is True
