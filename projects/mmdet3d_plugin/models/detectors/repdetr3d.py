@@ -170,6 +170,7 @@ class RepDetr3D(MVXTwoStageDetector):
                 )
             if self.temporal_memory.get('freeze_pretrained_detector', False):
                 self._freeze_temporal_memory_pretrained_detector()
+            self._configure_temporal_mod_from_config()
 
     def _maybe_log_tm_shapes(self, img_feats):
         if not (self.temporal_memory_enabled and self.tm_debug_shapes):
@@ -1221,6 +1222,31 @@ class RepDetr3D(MVXTwoStageDetector):
                 raise ValueError('depth router accepts online-only metadata')
             values.append([float(row.get(name, 0.0) or 0.0) for name in feature_names])
         return torch.as_tensor(values, device=device, dtype=dtype)
+
+    def _configure_temporal_mod_from_config(self):
+        spec = self.temporal_memory.get('mod_router', {}) or {}
+        if not spec.get('enabled', False):
+            return
+        configure = getattr(self.img_backbone, 'configure_temporal_mod', None)
+        if configure is None:
+            raise AttributeError('temporal MoD requires img_backbone.configure_temporal_mod')
+        blocks = tuple(int(block) for block in spec.get('routed_blocks', (9, 12, 15, 18, 21)))
+        if any(block < 1 for block in blocks):
+            raise ValueError('temporal MoD routed_blocks must be one-indexed positive block numbers')
+        configure(
+            routed_block_indices=tuple(block - 1 for block in blocks),
+            capacity_ratio=float(spec.get('capacity_ratio', 0.5)),
+            router_hidden_channels=int(spec.get('router_hidden_channels', 256)),
+            adapter_hidden_channels=int(spec.get('adapter_hidden_channels', 256)),
+        )
+        if not bool(spec.get('train_backbone', False)):
+            for parameter in self.img_backbone.parameters():
+                parameter.requires_grad = False
+            for module_name in ('temporal_mod_routers', 'temporal_mod_adapters'):
+                module = getattr(self.img_backbone, module_name, None)
+                if module is not None:
+                    for parameter in module.parameters():
+                        parameter.requires_grad = True
 
     def _tm_depth_router_enabled(self):
         return getattr(self, 'temporal_memory_depth_router', None) is not None

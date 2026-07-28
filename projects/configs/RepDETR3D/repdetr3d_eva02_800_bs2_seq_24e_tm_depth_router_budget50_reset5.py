@@ -4,10 +4,11 @@ work_dir = './work_dirs/repdetr3d_eva02_800_bs2_seq_24e_tm_depth_router_budget50
 load_from = './ckpts/repdetr3d_eva02_800_bs4_seq_24e.pth'
 find_unused_parameters = False
 
-# Training keeps the base per-GPU batch.  Evaluation is intentionally unbatched:
-# one route is selected per temporal sample at deployment.
+# Training emits four independent per-sample router decisions on each GPU.
+# Evaluation is intentionally unbatched: one route is selected per temporal
+# sample at deployment.
 router_eval_cfg = dict(data=dict(samples_per_gpu=1))
-data = dict(train=dict(queue_length=5))
+data = dict(samples_per_gpu=4, train=dict(queue_length=5))
 
 _online_router_features = (
     'frame_number', 'info_frame_idx', 'is_scene_start', 'dt_s',
