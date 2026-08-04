@@ -22,11 +22,11 @@ Use the existing base-checkpoint table `outputs/policy_signal_stats/val/policy_f
 
 For every validation frame:
 
-1. Read the deployed policy action from the untouched pre-frame state.
-2. Snapshot every mutable inference state.
-3. Evaluate the three non-canonical depth branches, restoring the pre-frame snapshot before each branch.
-4. Restore the pre-frame snapshot once more.
-5. Evaluate the deployed policy's canonical action last and leave its post-frame state active to advance the sequence.
+1. Snapshot every mutable inference state.
+2. Evaluate the deployed policy once, recording its selected action, prediction, and post-frame state.
+3. Restore the pre-frame snapshot before every remaining depth branch.
+4. Evaluate the other three actions under a temporary forced policy.
+5. Restore the saved deployed-policy post-frame state to advance the sequence.
 6. Store all four branch predictions under the same sample token.
 
 On scene-start frames, missing dense memory legitimately forces L24 behavior. The collector still emits all four aligned records, and the downstream notebook excludes those frames because adjacent-frame drift is undefined.
@@ -69,7 +69,7 @@ The collector must test snapshot independence by modifying live tensor state aft
 
 Temporarily replace only the controller's policy decision with a constant action in `{L8, L12, L16, L24}`. Preserve all trained modules and configuration. Temporarily disable only the maximum-memory-age override while a branch runs so it cannot replace a requested shallow action with L24. Restore the original policy and age limit after each branch, including exceptions.
 
-Before branching, obtain the canonical action using the original controller policy and the same online policy features used by normal inference. Do not derive the canonical action from ground truth.
+Obtain the canonical action by executing one normal deployed-policy pass from the pre-frame state. Preserve that pass's post-state, restore the pre-state for the other branches, and finally restore the canonical post-state. This avoids an additional policy-probe encoder pass while producing the same continuing trajectory as ordinary inference. Do not derive the canonical action from ground truth.
 
 ## Collector Interface
 
@@ -130,7 +130,7 @@ Write progress after each completed frame so a crash is diagnosable. Do not sile
 - snapshot clones tensors and nested containers without copying model parameters;
 - restore reproduces controller, head, and detector history exactly;
 - a forced branch always restores policy and age settings, including on exceptions;
-- branch order puts the canonical action last;
+- restoring the saved canonical post-state produces the same next-frame state as ordinary single-pass inference;
 - output token sets are identical across all four depths;
 - invalid batch size, missing temporal modules, and non-empty output directories fail clearly.
 
