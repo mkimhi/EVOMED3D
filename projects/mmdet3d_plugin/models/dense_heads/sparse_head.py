@@ -470,6 +470,27 @@ class SparseHead(AnchorFreeHead):
         self.memory_egopose = None
         self.memory_velo = None
 
+    def detach_memory(self):
+        """Truncate autograd history before the temporal bank is reused.
+
+        The bank is model state shared by consecutive training iterations, not
+        a mechanism for backpropagation through time.  In particular,
+        ``pre_update_memory`` can insert a value derived from the trainable
+        pseudo reference points into ``memory_reference_point``.  Keeping that
+        graph in the bank makes the next iteration attempt to backpropagate
+        through an already-freed graph.
+        """
+        for name in (
+            'memory_embedding',
+            'memory_reference_point',
+            'memory_timestamp',
+            'memory_egopose',
+            'memory_velo',
+        ):
+            value = getattr(self, name)
+            if torch.is_tensor(value):
+                setattr(self, name, value.detach())
+
     def pre_update_memory(self, data):
         x = data['prev_exists']
         B = x.size(0)
@@ -526,6 +547,10 @@ class SparseHead(AnchorFreeHead):
         self.memory_reference_point = transform_reference_points(self.memory_reference_point, data['ego_pose'], reverse=False)
         self.memory_timestamp -= data['timestamp'].unsqueeze(-1).unsqueeze(-1)
         self.memory_egopose = data['ego_pose'].unsqueeze(1) @ self.memory_egopose
+        # This bank is read by the next training iteration.  Its values must
+        # be data-only state; retaining the current graph here would make that
+        # next backward pass traverse a graph already freed by this iteration.
+        self.detach_memory()
     
     def forward(self, img_metas, **data):
         """Forward function.
@@ -591,7 +616,18 @@ class SparseHead(AnchorFreeHead):
 
         all_cls_scores = torch.stack(outputs_classes)
         all_bbox_preds = torch.stack(outputs_coords)
-        all_bbox_preds[..., 0:3] = (all_bbox_preds[..., 0:3] * (self.pc_range[3:6] - self.pc_range[0:3]) + self.pc_range[0:3])
+        # Keep the normalized predictions intact for autograd.  The decoder
+        # loss path may need this stacked tensor to propagate gradients back to
+        # routed backbone adapters, so mutating its xyz view in place corrupts
+        # the saved version used by backward.
+        all_bbox_preds = torch.cat(
+            [
+                all_bbox_preds[..., 0:3]
+                * (self.pc_range[3:6] - self.pc_range[0:3])
+                + self.pc_range[0:3],
+                all_bbox_preds[..., 3:],
+            ],
+            dim=-1)
         
         # update the memory bank
         self.post_update_memory(data, rec_ego_pose, all_cls_scores, all_bbox_preds, outs_dec, mask_dict)

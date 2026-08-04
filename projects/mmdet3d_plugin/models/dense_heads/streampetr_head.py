@@ -379,6 +379,19 @@ class StreamPETRHead(AnchorFreeHead):
         self.memory_egopose = None
         self.memory_velo = None
 
+    def detach_memory(self):
+        """Keep temporal state, but never retain an old autograd graph."""
+        for name in (
+            'memory_embedding',
+            'memory_reference_point',
+            'memory_timestamp',
+            'memory_egopose',
+            'memory_velo',
+        ):
+            value = getattr(self, name)
+            if torch.is_tensor(value):
+                setattr(self, name, value.detach())
+
     def pre_update_memory(self, data):
         x = data['prev_exists']
         B = x.size(0)
@@ -435,6 +448,9 @@ class StreamPETRHead(AnchorFreeHead):
         self.memory_reference_point = transform_reference_points(self.memory_reference_point, data['ego_pose'], reverse=False)
         self.memory_timestamp -= data['timestamp'].unsqueeze(-1).unsqueeze(-1)
         self.memory_egopose = data['ego_pose'].unsqueeze(1) @ self.memory_egopose
+        # Persistent state is consumed by the following iteration, after this
+        # iteration's autograd graph has been released.
+        self.detach_memory()
 
     def position_embeding(self, data, memory_centers, topk_indexes, img_metas):
         eps = 1e-5

@@ -6,6 +6,7 @@ router_eval_cfg = dict(data=dict(samples_per_gpu=1))
 model = dict(
     temporal_memory=dict(
         mod_router=dict(
+            enabled=True,
             type='token_depth',
             routed_blocks=(9, 12, 15, 18, 21),
             capacity_ratio=0.5,
@@ -14,8 +15,12 @@ model = dict(
             train_backbone=False,
             adapter_warmup_only=True,
             warmup_iters=4000,
+            # Keep newly trained MoD modules at the scheduled LR, but use a
+            # conservative LR for pretrained weights released after warmup.
+            pretrained_lr_mult=0.1,
         ),
-        # The warm-up aligns frozen-backbone routed features before detector loss.
+        # After 4,000 adapter-only iterations, training automatically switches
+        # to joint detector/backbone/router/adapter optimization.
         freeze_pretrained_detector=True,
     ),
 )

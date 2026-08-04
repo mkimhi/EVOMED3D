@@ -3,6 +3,8 @@ _base_ = ['./repdetr3d_eva02_800_bs2_seq_24e.py']
 work_dir = './work_dirs/repdetr3d_eva02_800_bs2_seq_24e_tm_reuse_k3'
 load_from = './ckpts/repdetr3d_eva02_800_bs4_seq_24e.pth'
 
+data = dict(samples_per_gpu=4)
+
 model = dict(
     temporal_memory=dict(
         enabled=True,

@@ -198,7 +198,9 @@ def test_depth_router_config_is_online_only_reset5_and_single_sample_eval():
     assert router["target_cost"] == 0.5
     assert all("gt" not in name.lower() for name in router["feature_names"])
     assert all("drift" not in name.lower() for name in router["feature_names"])
-    assert namespace["data"]["samples_per_gpu"] == 4
+    assert namespace["data"]["samples_per_gpu"] == 2
+    assert namespace["num_iters_per_epoch"] == 3516
+    assert namespace["runner"]["max_iters"] == 84384
     assert namespace["router_eval_cfg"]["data"]["samples_per_gpu"] == 1
 
 

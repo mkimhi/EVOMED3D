@@ -1079,8 +1079,11 @@ class RepDetr3D(MVXTwoStageDetector):
 
     @staticmethod
     def _tm_depth_router_sample_key(meta, index):
-        # Batch index distinguishes parallel clips that belong to one scene.
-        return (meta.get('scene_token', None), int(index))
+        # Each local batch position is a persistent streaming slot.  The
+        # controller records the scene token in that slot and resets its memory
+        # when the sampler starts a new video/chunk.  Including the scene token
+        # here would retain one GPU-resident cache entry per scene forever.
+        return int(index)
 
     def _tm_depth_router_previous_memory(self, sample_keys, current_l8):
         previous = []
@@ -1241,6 +1244,14 @@ class RepDetr3D(MVXTwoStageDetector):
         return anchor
 
     def _freeze_temporal_memory_pretrained_detector(self):
+        # Record the pretrained trainable set before freezing.  Some detector
+        # ``nn.Parameter`` objects are fixed geometry/loss constants and must
+        # remain non-trainable when adapter warmup later switches to joint
+        # optimization.
+        self._tm_warmup_unfreeze_parameter_names = {
+            name for name, param in self.named_parameters()
+            if param.requires_grad
+        }
         for param in self.parameters():
             param.requires_grad = False
         for module in (
@@ -1253,6 +1264,22 @@ class RepDetr3D(MVXTwoStageDetector):
                 continue
             for param in module.parameters():
                 param.requires_grad = True
+
+    def unfreeze_temporal_mod_warmup(self):
+        """Restore pretrained trainability after MoD adapter warmup."""
+        names = getattr(self, '_tm_warmup_unfreeze_parameter_names', None)
+        if names is None:
+            raise RuntimeError(
+                'MoD warmup transition requires freeze_pretrained_detector=True')
+        for name, param in self.named_parameters():
+            if name in names:
+                param.requires_grad = True
+        # The decoder keeps temporal state across streaming iterations.  Its
+        # warmup-era state must not be consumed by the first joint-training
+        # backward pass, whose graph has a different trainability boundary.
+        reset_memory = getattr(self.pts_bbox_head, 'reset_memory', None)
+        if callable(reset_memory):
+            reset_memory()
 
     def _freeze_temporal_memory_backbone_only(self):
         """Freeze EVA while retaining detector and temporal-router learning."""

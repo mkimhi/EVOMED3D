@@ -4,11 +4,20 @@ work_dir = './work_dirs/repdetr3d_eva02_800_bs2_seq_24e_tm_depth_router_budget50
 load_from = './ckpts/repdetr3d_eva02_800_bs4_seq_24e.pth'
 find_unused_parameters = False
 
-# Training emits four independent per-sample router decisions on each GPU.
+# Batch four reaches the 40 GB A100 limit after multiple routed-depth paths
+# have been exercised.  Batch two is the safe training default on four GPUs.
+# It still emits two independent per-sample router decisions per GPU.
 # Evaluation is intentionally unbatched: one route is selected per temporal
 # sample at deployment.
 router_eval_cfg = dict(data=dict(samples_per_gpu=1))
-data = dict(samples_per_gpu=4, train=dict(queue_length=5))
+data = dict(samples_per_gpu=2, train=dict(queue_length=5))
+
+# The base config assumes eight GPUs.  Preserve its 24-epoch sample budget
+# when running the documented four-GPU command.
+num_iters_per_epoch = 28130 // (4 * 2)
+evaluation = dict(interval=num_iters_per_epoch * 24)
+checkpoint_config = dict(interval=num_iters_per_epoch, max_keep_ckpts=1)
+runner = dict(type='IterBasedRunner', max_iters=num_iters_per_epoch * 24)
 
 _online_router_features = (
     'frame_number', 'info_frame_idx', 'is_scene_start', 'dt_s',

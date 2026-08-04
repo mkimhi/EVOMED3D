@@ -1,0 +1,3 @@
+[submodule "plugins/delegation-defaults"]
+	path = plugins/delegation-defaults
+	url = https://github.com/mkimhi/delegation-defaults.git

@@ -27,6 +27,7 @@ import time
 import os.path as osp
 from projects.mmdet3d_plugin.datasets.builder import build_dataloader
 from projects.mmdet3d_plugin.core.evaluation.eval_hooks import CustomDistEvalHook
+from projects.mmdet3d_plugin.core.hooks import TemporalModWarmupUnfreezeHook
 from projects.mmdet3d_plugin.datasets import custom_build_dataset
 def custom_train_detector(model,
                    dataset,
@@ -146,6 +147,19 @@ def custom_train_detector(model,
     runner.register_training_hooks(cfg.lr_config, optimizer_config,
                                    cfg.checkpoint_config, cfg.log_config,
                                    cfg.get('momentum_config', None))
+
+    mod_router_cfg = cfg.model.get('temporal_memory', {}).get('mod_router', {})
+    if mod_router_cfg.get('adapter_warmup_only', False):
+        warmup_iters = int(mod_router_cfg.get('warmup_iters', 0))
+        if warmup_iters <= 0:
+            raise ValueError('adapter_warmup_only requires mod_router.warmup_iters > 0')
+        runner.register_hook(
+            TemporalModWarmupUnfreezeHook(
+                warmup_iters=warmup_iters,
+                find_unused_parameters=cfg.get('find_unused_parameters', False),
+                pretrained_lr_mult=mod_router_cfg.get(
+                    'pretrained_lr_mult', 1.0)),
+            priority='NORMAL')
     
     # register profiler hook
     #trace_config = dict(type='tb_trace', dir_name='work_dir')
@@ -201,4 +215,3 @@ def custom_train_detector(model,
     elif cfg.load_from:
         runner.load_checkpoint(cfg.load_from)
     runner.run(data_loaders, cfg.workflow)
-
