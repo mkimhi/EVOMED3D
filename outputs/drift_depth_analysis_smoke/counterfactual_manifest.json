@@ -1,0 +1,51 @@
+{
+  "canonical_action_counts": {
+    "L12": 15,
+    "L24": 5
+  },
+  "canonical_state_advance_action": "deployed_policy",
+  "canonical_state_advance_mode": "deployed_policy",
+  "cfg_options": {
+    "model.temporal_memory.max_frames_between_full": 4
+  },
+  "checkpoint": "/home/moshekimhi_google_com/StreamPETR/work_dirs/repdetr3d_eva02_800_bs2_seq_24e_tm_mlp_policy_trainable_4level_reset4_similarity_online_offline_teacher_forcing_no_distill/iter_42192.pth",
+  "checkpoint_sha256": "b0640d891bc6a1b17d736bce55ebec8929bf085af9701b235f9e2fd3a3d5fe1e",
+  "config": "/home/moshekimhi_google_com/StreamPETR/projects/configs/RepDETR3D/repdetr3d_eva02_800_bs2_seq_24e_tm_mlp_policy_trainable_4level_reset5_similarity_online_offline_teacher_forcing_no_distill.py",
+  "config_sha256": "c290ba1629b79e9cda3c50b3df5c070ee8d53a9b1dec1d5a5112a16a4baa175d",
+  "created_at_utc": "2026-08-04T11:26:09.735383+00:00",
+  "prediction_paths": {
+    "L12": "/home/moshekimhi_google_com/StreamPETR/outputs/drift_depth_analysis_smoke/predictions_L12/results_nusc.json",
+    "L16": "/home/moshekimhi_google_com/StreamPETR/outputs/drift_depth_analysis_smoke/predictions_L16/results_nusc.json",
+    "L24": "/home/moshekimhi_google_com/StreamPETR/outputs/drift_depth_analysis_smoke/predictions_L24/results_nusc.json",
+    "L8": "/home/moshekimhi_google_com/StreamPETR/outputs/drift_depth_analysis_smoke/predictions_L8/results_nusc.json"
+  },
+  "run_id": "depth-counterfactual-20260804T112604Z",
+  "sample_count": 20,
+  "shared_pre_frame_state": true,
+  "snapshot_fields": {
+    "controller": [
+      "frame_index",
+      "frames_since_full",
+      "scene_token",
+      "memory",
+      "last_action",
+      "last_action_forced",
+      "last_distillation_loss",
+      "_policy_stats"
+    ],
+    "head": [
+      "memory_embedding",
+      "memory_reference_point",
+      "memory_timestamp",
+      "memory_egopose",
+      "memory_velo",
+      "latest_routing_metadata"
+    ],
+    "model": [
+      "prev_scene_token",
+      "test_flag",
+      "_tm_policy_prev*"
+    ]
+  },
+  "token_set_sha256": "ecf36a5433693a08ab62699db663a47fd0bcb0d725aa839abd853963e88a4558"
+}

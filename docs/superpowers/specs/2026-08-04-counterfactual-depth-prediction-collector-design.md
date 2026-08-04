@@ -61,7 +61,7 @@ Snapshot and restore tensor values by cloning rather than retaining aliases.
 - `prev_scene_token`;
 - previous prediction-derived policy features;
 - previous L8/L12 policy probe features;
-- any other `_tm_policy_prev_*` field present on the model.
+- any other `_tm_policy_prev*` field present on the model.
 
 The collector must test snapshot independence by modifying live tensor state after a snapshot and confirming the snapshot did not change.
 

@@ -1,0 +1,14 @@
+{
+  "canonical_action_counts": {
+    "L12": 15,
+    "L24": 5
+  },
+  "prediction_bytes": {
+    "L12": 2100234,
+    "L16": 2054961,
+    "L24": 2112523,
+    "L8": 2516717
+  },
+  "run_id": "depth-counterfactual-20260804T112604Z",
+  "sample_count": 20
+}
