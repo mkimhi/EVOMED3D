@@ -489,6 +489,73 @@ def test_repdetr3d_policy_supervision_loss_uses_class_weights():
     assert torch.allclose(loss, expected)
 
 
+def test_repdetr3d_policy_supervision_target_noise_changes_label_near_threshold(monkeypatch):
+    from projects.mmdet3d_plugin.models.detectors.repdetr3d import RepDetr3D
+    from projects.mmdet3d_plugin.models.temporal_memory.policies import build_frame_policy
+
+    model = RepDetr3D.__new__(RepDetr3D)
+    torch.nn.Module.__init__(model)
+    model.training = True
+    model.temporal_memory = dict(
+        policy_supervision=dict(
+            thresholds=(0.9, 0.76, 0.675),
+            target_noise_std=0.02,
+        ))
+    model.temporal_memory_policy = build_frame_policy(dict(
+        type="mlp",
+        checkpoint=None,
+        load_weights=False,
+        feature_names=["speed"],
+        hidden_dim=4,
+        labels=["easy", "medium", "hard", "very_hard"],
+        actions={"easy": "L8", "medium": "L12", "hard": "L16", "very_hard": "L24"},
+    ))
+    monkeypatch.setattr(torch, "randn_like", lambda value: torch.ones_like(value))
+    monkeypatch.setattr(
+        model,
+        "_temporal_memory_policy_target_score",
+        lambda previous, current: torch.as_tensor(0.89))
+
+    loss = model._temporal_memory_policy_supervision_loss(
+        {"speed": 1.0},
+        [torch.ones(1, 1, 2, 1, 1)],
+        [torch.ones(1, 1, 2, 1, 1)],
+    )
+
+    logits = model.temporal_memory_policy.logits({"speed": 1.0})
+    expected = torch.nn.functional.cross_entropy(
+        logits,
+        torch.as_tensor([0], dtype=torch.long, device=logits.device),
+    )
+    assert torch.allclose(loss, expected)
+
+
+def test_repdetr3d_policy_supervision_feature_noise_uses_policy_scale(monkeypatch):
+    from projects.mmdet3d_plugin.models.detectors.repdetr3d import RepDetr3D
+    from projects.mmdet3d_plugin.models.temporal_memory.policies import build_frame_policy
+
+    model = RepDetr3D.__new__(RepDetr3D)
+    torch.nn.Module.__init__(model)
+    model.training = True
+    model.temporal_memory = dict(
+        policy_supervision=dict(feature_noise_std=0.5))
+    model.temporal_memory_policy = build_frame_policy(dict(
+        type="mlp",
+        checkpoint=None,
+        load_weights=False,
+        feature_names=["speed", "count"],
+        mean=[0.0, 0.0],
+        scale=[2.0, 10.0],
+    ))
+    monkeypatch.setattr(torch, "randn", lambda *args, **kwargs: torch.ones(*args, **kwargs))
+
+    noisy = model._temporal_memory_noisy_policy_features(
+        {"speed": 3.0, "count": 7.0})
+
+    assert noisy["speed"] == 4.0
+    assert noisy["count"] == 12.0
+
+
 def test_repdetr3d_policy_supervision_zero_loss_keeps_ddp_loss_key_when_no_pairs():
     from projects.mmdet3d_plugin.models.detectors.repdetr3d import RepDetr3D
 

@@ -641,10 +641,17 @@ class RepDetr3D(MVXTwoStageDetector):
         if not isinstance(policy, torch.nn.Module) or not hasattr(policy, 'logits'):
             return None
         score = self._temporal_memory_policy_target_score(previous_full, current_full)
-        target_index = self._temporal_memory_policy_target_index(float(score.detach().cpu()))
-        logits = policy.logits(policy_features)
-        target = torch.as_tensor([target_index], dtype=torch.long, device=logits.device)
         spec = self.temporal_memory.get('policy_supervision', {}) or {}
+        target_noise_std = float(spec.get('target_noise_std', 0.0) or 0.0)
+        if self.training and target_noise_std > 0.0:
+            score = score + torch.randn_like(score) * target_noise_std
+            clamp = spec.get('target_noise_clamp', (0.0, 1.0))
+            if clamp is not None:
+                low, high = clamp
+                score = score.clamp(float(low), float(high))
+        target_index = self._temporal_memory_policy_target_index(float(score.detach().cpu()))
+        logits = policy.logits(self._temporal_memory_noisy_policy_features(policy_features))
+        target = torch.as_tensor([target_index], dtype=torch.long, device=logits.device)
         loss = F.cross_entropy(logits, target)
         class_weights = spec.get('class_weights', None)
         if class_weights is not None:
@@ -654,6 +661,24 @@ class RepDetr3D(MVXTwoStageDetector):
             loss = loss * class_weights[target_index]
         weight = float(spec.get('weight', 1.0))
         return loss * weight
+
+    def _temporal_memory_noisy_policy_features(self, policy_features):
+        spec = self.temporal_memory.get('policy_supervision', {}) or {}
+        feature_noise_std = float(spec.get('feature_noise_std', 0.0) or 0.0)
+        if not self.training or feature_noise_std <= 0.0:
+            return policy_features
+        policy = getattr(self, 'temporal_memory_policy', None)
+        feature_names = getattr(policy, 'feature_names', None)
+        scale = getattr(policy, 'scale', None)
+        if not feature_names or scale is None:
+            return policy_features
+        scale = scale.detach().float().cpu()
+        noise = torch.randn(len(feature_names), dtype=scale.dtype) * feature_noise_std * scale
+        noisy = dict(policy_features)
+        for index, name in enumerate(feature_names):
+            value = noisy.get(name, 0.0) or 0.0
+            noisy[name] = float(value) + float(noise[index])
+        return noisy
 
     def _temporal_memory_policy_supervision_active(self):
         spec = self.temporal_memory.get('policy_supervision', None)
