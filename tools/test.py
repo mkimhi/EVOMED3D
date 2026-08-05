@@ -107,6 +107,10 @@ def parse_args():
         type=int,
         default=5,
         help='number of warmup samples to skip in timing summaries')
+    parser.add_argument(
+        '--policy-stats',
+        action='store_true',
+        help='print final temporal-policy action counts (single GPU only)')
     args = parser.parse_args()
     if 'LOCAL_RANK' not in os.environ:
         os.environ['LOCAL_RANK'] = str(args.local_rank)
@@ -121,6 +125,23 @@ def parse_args():
     return args
 
 
+def policy_stats_report(model):
+    module = getattr(model, 'module', model)
+    controller = getattr(module, 'temporal_memory_controller', None)
+    if controller is None or not hasattr(controller, 'policy_stats'):
+        raise ValueError('model does not expose temporal policy statistics')
+    stats = controller.policy_stats()
+    total = sum(int(stats.get(action, 0))
+                for action in ('L8', 'L12', 'L16', 'L24'))
+    fields = ' '.join(
+        f'{action}={int(stats.get(action, 0))}'
+        for action in ('L8', 'L12', 'L16', 'L24'))
+    return (
+        f'[temporal_memory_policy_final] samples={total} {fields} '
+        f'forced_l24={int(stats.get("forced_l24", 0))} '
+        f'learned_l24={int(stats.get("learned_l24", 0))}')
+
+
 def main():
     args = parse_args()
 
@@ -132,6 +153,8 @@ def main():
 
     if args.eval and args.format_only:
         raise ValueError('--eval and --format_only cannot be both specified')
+    if args.policy_stats and args.launcher != 'none':
+        raise ValueError('--policy-stats currently requires single-GPU testing')
 
     if args.out is not None and not args.out.endswith(('.pkl', '.pickle')):
         raise ValueError('The output file must be a pkl file.')
@@ -262,6 +285,8 @@ def main():
 
     rank, _ = get_dist_info()
     if rank == 0:
+        if args.policy_stats:
+            print(policy_stats_report(model))
         if args.out:
             print(f'\nwriting results to {args.out}')
             assert False

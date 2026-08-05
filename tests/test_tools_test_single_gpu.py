@@ -1,6 +1,7 @@
 import sys
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 from mmcv import ConfigDict
@@ -164,3 +165,24 @@ def test_custom_single_gpu_test_flattens_bbox_result_dict():
     outputs = custom_single_gpu_test(DictResultModel(), DummyLoader(), timing_warmup=0)
 
     assert outputs == ['prediction']
+
+
+def test_policy_stats_report_formats_complete_histogram():
+    test_path = Path(__file__).resolve().parents[1] / 'tools' / 'test.py'
+    spec = importlib.util.spec_from_file_location(
+        'stream_petr_tools_test_policy_stats', test_path)
+    test_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(test_module)
+    controller = SimpleNamespace(
+        policy_stats=lambda: {
+            'L8': 2, 'L12': 3, 'L16': 4, 'L24': 5,
+            'forced_l24': 1, 'learned_l24': 2,
+        })
+    model = SimpleNamespace(
+        module=SimpleNamespace(temporal_memory_controller=controller))
+
+    report = test_module.policy_stats_report(model)
+
+    assert report == (
+        '[temporal_memory_policy_final] samples=14 '
+        'L8=2 L12=3 L16=4 L24=5 forced_l24=1 learned_l24=2')
