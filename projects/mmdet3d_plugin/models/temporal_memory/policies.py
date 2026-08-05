@@ -103,6 +103,7 @@ class MlpFramePolicy(torch.nn.Module):
         actions=None,
         mean=None,
         scale=None,
+        teacher_forcing_residual_std=None,
         requires_l8_similarity=False,
         requires_previous_l12_similarity=False,
     ):
@@ -114,6 +115,8 @@ class MlpFramePolicy(torch.nn.Module):
             feature_names = payload['feature_names']
             mean = payload.get('mean', mean)
             scale = payload.get('scale', scale)
+            teacher_forcing_residual_std = payload.get(
+                'teacher_forcing_residual_std', teacher_forcing_residual_std)
             hidden_dim = payload.get('hidden_dim', hidden_dim)
             labels = payload.get('labels', labels)
             actions = payload.get('actions', actions)
@@ -130,6 +133,16 @@ class MlpFramePolicy(torch.nn.Module):
         scale = torch.as_tensor(scale if scale is not None else [1.0] * len(self.feature_names), dtype=torch.float32)
         self.register_buffer('mean', mean)
         self.register_buffer('scale', torch.where(scale == 0, torch.ones_like(scale), scale))
+        residual_std = torch.as_tensor(
+            teacher_forcing_residual_std
+            if teacher_forcing_residual_std is not None
+            else [0.0] * len(self.feature_names),
+            dtype=torch.float32,
+        )
+        if residual_std.numel() != len(self.feature_names):
+            raise ValueError(
+                'teacher_forcing_residual_std must match policy feature count')
+        self.register_buffer('teacher_forcing_residual_std', residual_std)
         labels = labels or ['easy', 'medium', 'hard']
         self.labels = [str(label) for label in labels]
         self.actions = dict(actions or {'easy': 'L8', 'medium': 'L12', 'hard': 'L24'})
