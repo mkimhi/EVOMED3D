@@ -1,0 +1,25 @@
+{
+  "action_counts": {
+    "L12": 1,
+    "L24": 1
+  },
+  "checkpoint": "/home/moshekimhi_google_com/StreamPETR/work_dirs/repdetr3d_eva02_800_bs2_seq_24e_tm_mlp_policy_trainable_4level_reset4_similarity_online_offline_teacher_forcing_feature_noise_no_distill/iter_42192.pth",
+  "checkpoint_sha256": "557119f21927af3f3f1d002e77ce98b429ebed02dff08d43e212d70d111406ea",
+  "config": "/home/moshekimhi_google_com/StreamPETR/projects/configs/RepDETR3D/repdetr3d_eva02_800_bs2_seq_24e_tm_mlp_policy_trainable_4level_reset5_similarity_online_offline_teacher_forcing_no_distill.py",
+  "config_sha256": "c290ba1629b79e9cda3c50b3df5c070ee8d53a9b1dec1d5a5112a16a4baa175d",
+  "counting_convention": "one multiply-add equals two FLOPs",
+  "data_split": "val",
+  "forced_action": "L12",
+  "frames_jsonl": "/home/moshekimhi_google_com/StreamPETR/outputs/gflops/l12_v2/frames.jsonl",
+  "image_shape": [
+    1,
+    6,
+    3,
+    320,
+    800
+  ],
+  "mean_gflops": 4089.867983408,
+  "mean_macs": 2044933991704.0,
+  "sample_count": 2,
+  "scope": "end-to-end detector inference per six-camera timestamp"
+}

@@ -1,0 +1,25 @@
+{
+  "action_counts": {
+    "L24": 1,
+    "L8": 1
+  },
+  "checkpoint": "/home/moshekimhi_google_com/StreamPETR/ckpts/repdetr3d_eva02_800_bs4_seq_24e.pth",
+  "checkpoint_sha256": "e5e09ae43bcb7ab27b5f1d57eb5f377576e80626b697637feb2bbf6492ed7819",
+  "config": "/home/moshekimhi_google_com/StreamPETR/projects/configs/RepDETR3D/repdetr3d_eva02_800_bs2_seq_24e_tm_gated_k3_l8_no_distill.py",
+  "config_sha256": "b3f8cfaef8f5deb3cffc40b55449c918ea6e19a7f0e05e3eb2bf70c38b18a671",
+  "counting_convention": "one multiply-add equals two FLOPs",
+  "data_split": "val",
+  "forced_action": "L8",
+  "frames_jsonl": "/home/moshekimhi_google_com/StreamPETR/outputs/gflops/updater_gated_l8/frames.jsonl",
+  "image_shape": [
+    1,
+    6,
+    3,
+    320,
+    800
+  ],
+  "mean_gflops": 3677.97377912,
+  "mean_macs": 1838986889560.0,
+  "sample_count": 2,
+  "scope": "end-to-end detector inference per six-camera timestamp"
+}
