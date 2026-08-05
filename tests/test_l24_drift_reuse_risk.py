@@ -15,6 +15,10 @@ from tools.l24_drift_reuse_risk import (
     select_reuse_targets,
     validate_collection_manifest,
 )
+from tools.collect_l24_drift_reuse_risk import (
+    build_collection_manifest,
+    record_target_drift,
+)
 
 
 def box(name, xy, score):
@@ -26,6 +30,10 @@ def box(name, xy, score):
         'velocity': np.array([0.0, 0.0]),
         'score': score,
     }
+
+
+def feature(value):
+    return [torch.full((1, 1, 2, 1, 1), value)]
 
 
 def test_select_reuse_targets_is_scene_balanced_and_skips_keyframes():
@@ -102,3 +110,19 @@ def test_validate_collection_manifest_rejects_wrong_provenance(tmp_path):
     }
     with pytest.raises(ValueError, match='base full L24'):
         validate_collection_manifest(manifest)
+
+
+def test_manifest_marks_base_l24_and_naive_reuse_k2(tmp_path):
+    manifest = build_collection_manifest(
+        'run', tmp_path / 'c.py', tmp_path / 'm.pth',
+        tmp_path / 'selection.csv', tmp_path / 'drift.csv',
+        tmp_path / 'results.json', 'config-hash', 'checkpoint-hash',
+        9, 100, 2000)
+    assert manifest['representation_source'] == 'base_full_l24_backbone_neck'
+    assert manifest['prediction_mode'] == 'naive_reuse_k2'
+    assert manifest['keyframe_interval'] == 2
+
+
+def test_target_drift_rejects_cross_scene_or_short_history():
+    with pytest.raises(ValueError, match='two full-L24 history frames'):
+        record_target_drift('b-0', 'scene-b', {'scene-a': [feature(1.0)]})
