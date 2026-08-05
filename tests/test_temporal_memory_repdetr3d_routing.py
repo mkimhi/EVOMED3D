@@ -180,9 +180,13 @@ def test_repdetr3d_training_temporal_path_supports_mixed_batch_policy_actions():
         return torch.full((frame_data["img"].size(0), 1, 1, 1, 1), value)
 
     model._profile_extract_partial_features = partial
-    model._temporal_memory_policy_features = lambda img_metas, data, scene_token=None: {
+    model._temporal_memory_policy_features = lambda img_metas, data, scene_token=None, frame_number=None: {
         "desired_action": img_metas[0]["desired_action"],
-        "_state": {"scene_token": scene_token, "is_scene_start": False},
+        "_state": {
+            "scene_token": scene_token,
+            "frame_number": frame_number,
+            "is_scene_start": False,
+        },
     }
 
     features, _ = model._extract_img_feat_temporal_memory_train(
@@ -601,8 +605,10 @@ def test_repdetr3d_counterfactual_policy_supervision_uses_sample_token():
     from projects.mmdet3d_plugin.models.temporal_memory.policies import build_frame_policy
 
     class Targets:
-        def label_index(self, token, labels):
+        def label_index(self, token, labels, scene_token=None, frame_number=None):
             assert token == "sample-a"
+            assert scene_token == "scene-a"
+            assert frame_number == 3
             assert labels == ["L8", "L12", "L16", "L24"]
             return 2
 
@@ -624,7 +630,10 @@ def test_repdetr3d_counterfactual_policy_supervision_uses_sample_token():
         logits, torch.as_tensor([2], dtype=torch.long, device=logits.device))
 
     loss = model._temporal_memory_policy_supervision_loss(
-        {"speed": 1.0, "_state": {"sample_token": "sample-a"}}, None, None)
+        {"speed": 1.0, "_state": {
+            "sample_token": "sample-a", "scene_token": "scene-a",
+            "frame_number": 3,
+        }}, None, None)
 
     assert torch.allclose(loss, expected)
 
@@ -644,6 +653,24 @@ def test_repdetr3d_counterfactual_supervision_uses_explicit_step_window():
     assert model._temporal_memory_policy_supervision_active() is True
     model._tm_train_step = 100
     assert model._temporal_memory_policy_supervision_active() is False
+
+
+def test_repdetr3d_prediction_policy_features_include_velocity():
+    from projects.mmdet3d_plugin.models.detectors.repdetr3d import RepDetr3D
+
+    model = RepDetr3D.__new__(RepDetr3D)
+    model.temporal_memory = dict(policy_prediction_score_thr=0.1)
+    boxes = torch.as_tensor([
+        [3.0, 4.0, 0.0, 4.0, 2.0, 1.5, 0.0, 6.0, 8.0],
+    ])
+
+    features = model._tm_prediction_features([
+        dict(boxes_3d=boxes, scores_3d=torch.as_tensor([0.9]))
+    ])
+
+    assert features['avg_object_distance_m'] == 5.0
+    assert features['avg_object_speed_mps'] == 10.0
+    assert features['max_object_speed_mps'] == 10.0
 
 
 def test_repdetr3d_policy_supervision_zero_loss_keeps_ddp_loss_key_when_no_pairs():

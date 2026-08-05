@@ -15,6 +15,7 @@ class CounterfactualActionTargets:
         if not csv_path.is_file():
             raise FileNotFoundError(csv_path)
         targets = {}
+        scene_frame_targets = {}
         with csv_path.open(newline='') as stream:
             reader = csv.DictReader(stream)
             missing = {token_column, action_column} - set(reader.fieldnames or ())
@@ -31,15 +32,33 @@ class CounterfactualActionTargets:
                     raise ValueError(
                         f'unsupported counterfactual policy action: {action}')
                 targets[token] = action
+                if 'scene_token' in row and 'frame_number' in row:
+                    scene_frame = (
+                        str(row['scene_token']), int(float(row['frame_number'])))
+                    if scene_frame in scene_frame_targets:
+                        raise ValueError(
+                            'duplicate counterfactual policy target scene/frame: '
+                            f'{scene_frame}')
+                    scene_frame_targets[scene_frame] = action
         if not targets:
             raise ValueError('counterfactual target CSV contains no targets')
         self.targets = targets
+        self.scene_frame_targets = scene_frame_targets
 
-    def label_index(self, token, labels):
+    def label_index(
+        self,
+        token,
+        labels,
+        scene_token=None,
+        frame_number=None,
+    ):
         token = str(token)
-        if token not in self.targets:
+        action = self.targets.get(token)
+        if action is None and scene_token is not None and frame_number is not None:
+            action = self.scene_frame_targets.get(
+                (str(scene_token), int(frame_number)))
+        if action is None:
             raise KeyError(f'missing counterfactual policy target for token {token}')
-        action = self.targets[token]
         labels = list(labels)
         if action not in labels:
             raise ValueError(

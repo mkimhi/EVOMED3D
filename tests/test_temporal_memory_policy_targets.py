@@ -34,3 +34,21 @@ def test_counterfactual_target_provider_reports_missing_token(tmp_path):
     provider = CounterfactualActionTargets(path)
     with pytest.raises(KeyError, match='counterfactual policy target'):
         provider.label_index('missing', ['L8', 'L12', 'L16', 'L24'])
+
+
+def test_counterfactual_target_provider_falls_back_to_scene_frame(tmp_path):
+    path = tmp_path / 'targets.csv'
+    with path.open('w', newline='') as stream:
+        writer = csv.DictWriter(
+            stream,
+            fieldnames=['token', 'scene_token', 'frame_number', 'oracle_action'])
+        writer.writeheader()
+        writer.writerow(dict(
+            token='sample-a', scene_token='scene-a', frame_number=3,
+            oracle_action='L24'))
+
+    provider = CounterfactualActionTargets(path)
+
+    assert provider.label_index(
+        'unavailable-token', ['L8', 'L12', 'L16', 'L24'],
+        scene_token='scene-a', frame_number=3) == 3

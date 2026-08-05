@@ -111,6 +111,27 @@ def test_prediction_features_apply_score_threshold():
     assert features['avg_object_distance_m'] == pytest.approx(3.0)
 
 
+def test_previous_prediction_features_use_ego_relative_distance():
+    frames = [
+        {'token': 'a0', 'scene_token': 'A', 'canonical_action': 'L8'},
+        {'token': 'a1', 'scene_token': 'A', 'canonical_action': 'L24'},
+    ]
+    branches = {
+        action: {token: [] for token in ('a0', 'a1')}
+        for action in ('L8', 'L12', 'L16', 'L24')
+    }
+    branches['L8']['a0'] = [detection(x=1003.0)]
+    metadata = {
+        'a0': {'ego_x_m': 1000.0, 'ego_y_m': 0.0},
+        'a1': {'ego_x_m': 1001.0, 'ego_y_m': 0.0},
+    }
+
+    rows = MODULE.build_previous_prediction_rows(
+        frames, branches, metadata=metadata)
+
+    assert rows[1]['avg_object_distance_m'] == pytest.approx(3.0)
+
+
 def test_manifest_requires_shared_pre_frame_state():
     with pytest.raises(ValueError, match='shared pre-frame state'):
         MODULE.validate_manifest({'shared_pre_frame_state': False})

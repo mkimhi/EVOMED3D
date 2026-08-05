@@ -394,18 +394,21 @@ class RepDetr3D(MVXTwoStageDetector):
                 sample_scene = sample_meta.get('scene_token') if isinstance(sample_meta, dict) else None
                 indices = torch.as_tensor([batch_index], dtype=torch.long)
                 sample_data = self._temporal_memory_slice_batch_data(frame_data, indices)
-                features = self._temporal_memory_policy_features(
-                    [sample_meta],
-                    sample_data,
-                    scene_token=sample_scene)
-                policy_features.append(features)
                 state = self._tm_batch_states[batch_index]
-                prev_ok = self._temporal_memory_sample_prev_exists(prev_exists, batch_index)
+                prev_ok = self._temporal_memory_sample_prev_exists(
+                    prev_exists, batch_index)
                 is_reset_frame = (
                     state.get('scene_token') != sample_scene
                     or not prev_ok
                     or state.get('memory') is None
                 )
+                features = self._temporal_memory_policy_features(
+                    [sample_meta],
+                    sample_data,
+                    scene_token=sample_scene,
+                    frame_number=(
+                        0 if is_reset_frame else state.get('frame_index', 0)))
+                policy_features.append(features)
                 is_reset_frames.append(is_reset_frame)
                 if is_reset_frame or self._temporal_memory_sample_force_full_for_age(state):
                     action = 'L24'
@@ -497,7 +500,8 @@ class RepDetr3D(MVXTwoStageDetector):
                 state['memory'] = self._temporal_memory_select_feature_batch(
                     output,
                     torch.as_tensor([batch_index], dtype=torch.long))
-                state['frame_index'] = int(state.get('frame_index', 0)) + 1
+                state['frame_index'] = int(
+                    policy_features[batch_index]['_state']['frame_number']) + 1
                 state['frames_since_full'] = 0 if action == 'L24' else int(state.get('frames_since_full', 0)) + 1
                 self.temporal_memory_controller._policy_stats[action] = (
                     self.temporal_memory_controller._policy_stats.get(action, 0) + 1)
@@ -666,12 +670,22 @@ class RepDetr3D(MVXTwoStageDetector):
         if spec.get('target') == 'counterfactual_action':
             state = policy_features.get('_state', {}) or {}
             token = state.get('sample_token')
-            if not token:
-                raise KeyError('counterfactual policy supervision requires a sample token')
+            if not token and (
+                state.get('scene_token') is None
+                or state.get('frame_number') is None
+            ):
+                raise KeyError(
+                    'counterfactual policy supervision requires a sample token '
+                    'or scene/frame identity')
             targets = getattr(self, '_tm_counterfactual_targets', None)
             if targets is None:
                 raise RuntimeError('counterfactual policy targets were not loaded')
-            target_index = targets.label_index(token, policy.labels)
+            target_index = targets.label_index(
+                token,
+                policy.labels,
+                scene_token=state.get('scene_token'),
+                frame_number=state.get('frame_number'),
+            )
         else:
             score = self._temporal_memory_policy_target_score(previous_full, current_full)
             target_noise_std = float(spec.get('target_noise_std', 0.0) or 0.0)
@@ -1015,6 +1029,10 @@ class RepDetr3D(MVXTwoStageDetector):
             features['avg_box_height_m'] = float(dims[:, 2].mean())
             features['avg_box_volume_m3'] = float(dims.prod(dim=1).mean())
             features['avg_box_area_m2'] = float((dims[:, 0] * dims[:, 1]).mean())
+        if boxes.shape[1] >= 9:
+            speeds = torch.linalg.vector_norm(boxes[:, 7:9], dim=1)
+            features['avg_object_speed_mps'] = float(speeds.mean())
+            features['max_object_speed_mps'] = float(speeds.max())
         return features
 
     def _tm_policy_offline_mode(self):
@@ -1037,13 +1055,23 @@ class RepDetr3D(MVXTwoStageDetector):
         else:
             raise ValueError(f'Unsupported temporal memory policy_offline_features: {mode}')
 
-    def _temporal_memory_policy_features(self, img_metas, data, scene_token=None, l8_similarity=None):
+    def _temporal_memory_policy_features(
+        self,
+        img_metas,
+        data,
+        scene_token=None,
+        l8_similarity=None,
+        frame_number=None,
+    ):
         meta = img_metas[0] if img_metas and isinstance(img_metas[0], dict) else {}
         sample_token = meta.get('token', meta.get('sample_idx', None))
         if sample_token is None:
             filename = meta.get('filename', None)
             sample_token = filename[0] if isinstance(filename, (list, tuple)) and filename else filename
-        frame_number = int(meta.get('frame_idx', getattr(self.temporal_memory_controller, 'frame_index', 0)))
+        if frame_number is None:
+            frame_number = meta.get(
+                'frame_idx', getattr(self.temporal_memory_controller, 'frame_index', 0))
+        frame_number = int(frame_number)
         timestamp = self._tm_scalar(data.get('timestamp', meta.get('timestamp', 0.0)))
         x, y, z, yaw = self._tm_pose_xy_yaw(data)
         prev = getattr(self, '_tm_policy_prev_state', None)
@@ -1096,6 +1124,7 @@ class RepDetr3D(MVXTwoStageDetector):
         features['_state'] = dict(
             sample_token=None if sample_token is None else str(sample_token),
             scene_token=scene_token,
+            frame_number=frame_number,
             timestamp=timestamp,
             ego_x_m=x,
             ego_y_m=y,

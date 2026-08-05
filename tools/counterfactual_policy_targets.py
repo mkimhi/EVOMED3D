@@ -167,7 +167,7 @@ def zero_offline_features():
     return {name: 0.0 for name in OFFLINE_FEATURES}
 
 
-def prediction_features(detections, score_threshold=0.1):
+def prediction_features(detections, score_threshold=0.1, ego_xy=None):
     detections = [
         item for item in detections
         if float(item.get('detection_score', 0.0)) >= score_threshold
@@ -177,6 +177,8 @@ def prediction_features(detections, score_threshold=0.1):
         return features
     translations = np.asarray(
         [item['translation'][:2] for item in detections], dtype=np.float64)
+    if ego_xy is not None:
+        translations = translations - np.asarray(ego_xy, dtype=np.float64)[:2]
     distances = np.linalg.norm(translations, axis=1)
     sizes = np.asarray(
         [item['size'][:3] for item in detections], dtype=np.float64)
@@ -206,7 +208,7 @@ def prediction_features(detections, score_threshold=0.1):
     return features
 
 
-def build_previous_prediction_rows(frames, branch_results):
+def build_previous_prediction_rows(frames, branch_results, metadata=None):
     rows = []
     previous_scene = None
     previous_features = None
@@ -218,8 +220,12 @@ def build_previous_prediction_rows(frames, branch_results):
             rows.append(dict(previous_features))
         action = frame['canonical_action']
         token = str(frame['token'])
+        frame_metadata = {} if metadata is None else metadata[token]
+        ego_xy = None
+        if 'ego_x_m' in frame_metadata and 'ego_y_m' in frame_metadata:
+            ego_xy = (frame_metadata['ego_x_m'], frame_metadata['ego_y_m'])
         previous_features = prediction_features(
-            branch_results[action][token])
+            branch_results[action][token], ego_xy=ego_xy)
         previous_scene = scene
     return rows
 
@@ -242,7 +248,8 @@ def build_target_rows(
     max_loss_degradation=None,
 ):
     metric_config = metric_config or MetricConfig()
-    previous_rows = build_previous_prediction_rows(frames, branch_results)
+    previous_rows = build_previous_prediction_rows(
+        frames, branch_results, metadata=metadata)
     output = []
     for frame, previous_features in zip(frames, previous_rows):
         token = str(frame['token'])
@@ -492,7 +499,8 @@ def main():
     )
     csv_path = output_dir / 'counterfactual_policy_targets.csv'
     pd.DataFrame(rows).to_csv(csv_path, index=False)
-    previous_rows = build_previous_prediction_rows(frames, branch_results)
+    previous_rows = build_previous_prediction_rows(
+        frames, branch_results, metadata=metadata)
     residual_std = teacher_forcing_residual_std(
         frames, metadata_frame, previous_rows)
     target_manifest = dict(
