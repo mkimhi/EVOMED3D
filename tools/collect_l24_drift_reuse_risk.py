@@ -132,6 +132,10 @@ def _validate_temporal_memory_config(cfg):
         raise ValueError('collector requires temporal_memory.updater=reuse')
     if int(temporal_memory.get('keyframe_interval', 1)) != 2:
         raise ValueError('collector requires temporal_memory.keyframe_interval=2')
+    policy = temporal_memory.get('policy', None)
+    if policy is not None:
+        if not isinstance(policy, dict) or policy.get('type', 'fixed_interval') != 'fixed_interval':
+            raise ValueError('collector requires the fixed-interval naive-reuse policy')
     return {
         'enabled': True,
         'updater': 'reuse',
@@ -150,15 +154,16 @@ def _import_config_plugin(cfg, config_path):
 def _restrict_dataset_to_selected_scenes(dataset, scene_tokens):
     if not hasattr(dataset, 'data_infos'):
         raise ValueError('collector requires dataset.data_infos for sequential scene selection')
-    selected_infos = [
-        info for info in dataset.data_infos
+    selected_indices = [
+        index for index, info in enumerate(dataset.data_infos)
         if isinstance(info, dict) and info.get('scene_token') in scene_tokens
     ]
+    selected_infos = [dataset.data_infos[index] for index in selected_indices]
     if not selected_infos:
         raise ValueError('no frames remain after selecting qualified scenes')
     dataset.data_infos = selected_infos
     if hasattr(dataset, 'flag'):
-        dataset.flag = np.asarray(dataset.flag)[:len(selected_infos)]
+        dataset.flag = np.asarray(dataset.flag)[selected_indices]
     dataset._eval_sample_tokens = {info['token'] for info in selected_infos}
     return selected_infos
 
@@ -197,7 +202,11 @@ def _format_target_predictions(dataset, target_infos, predictions, output_dir):
     try:
         dataset.data_infos = list(target_infos)
         if original_flag is not None:
-            dataset.flag = np.asarray(original_flag)[:len(target_infos)]
+            target_indices = {
+                info['token']: index for index, info in enumerate(original_infos)
+            }
+            dataset.flag = np.asarray(original_flag)[[
+                target_indices[info['token']] for info in target_infos]]
         staging = output_dir / '_formatted_targets'
         result_files, _ = dataset.format_results(
             predictions, jsonfile_prefix=str(staging))
@@ -234,8 +243,39 @@ def _assert_reuse_action(model):
     controller = getattr(model, 'temporal_memory_controller', None)
     if controller is None or getattr(controller, 'updater_name', None) != 'reuse':
         raise ValueError('collector requires the temporal-memory reuse updater')
-    if getattr(controller, 'last_action', None) == 'L24':
-        raise ValueError('selected target did not take the naive-reuse action')
+    expected_action = getattr(getattr(controller, 'policy', None), 'partial_action', None)
+    if expected_action is None or controller.last_action != expected_action:
+        raise ValueError('selected target did not take the configured naive-reuse action')
+
+
+def order_target_predictions(selected_tokens, predictions_by_token):
+    """Return target predictions in selection.csv order, rejecting gaps/extras."""
+    selected_tokens = list(selected_tokens)
+    if set(predictions_by_token) != set(selected_tokens):
+        raise ValueError('target prediction tokens do not exactly match selection.csv')
+    ordered = []
+    for token in selected_tokens:
+        prediction_items = predictions_by_token[token]
+        if not isinstance(prediction_items, list) or len(prediction_items) != 1:
+            raise ValueError('collector requires exactly one target prediction per token')
+        ordered.extend(prediction_items)
+    return ordered
+
+
+def batch_token_and_scene(data):
+    """Read one test-time sample's identity from its nested metadata."""
+    metadata = data.get('img_metas')
+    while isinstance(metadata, (list, tuple)):
+        if not metadata:
+            break
+        metadata = metadata[0]
+    if not isinstance(metadata, dict):
+        raise ValueError('collector requires a single frame metadata dictionary')
+    token = metadata.get('sample_idx', metadata.get('token'))
+    scene_token = metadata.get('scene_token')
+    if not token or not scene_token:
+        raise ValueError('batch metadata must contain token and scene_token')
+    return token, scene_token
 
 
 def parse_args():
@@ -313,6 +353,8 @@ def main():
         shuffle=False,
         nonshuffler_sampler=cfg.data.nonshuffler_sampler,
     )
+    if len(data_loader) != len(collection_infos):
+        raise ValueError('sequential data loader length does not match selected frame count')
     model = build_model(cfg.model, test_cfg=cfg.get('test_cfg'))
     if cfg.get('fp16') is not None:
         wrap_fp16_model(model)
@@ -324,12 +366,14 @@ def main():
     parallel_model = MMDataParallel(model, device_ids=[device_index])
 
     target_tokens = set(selected_tokens)
-    target_predictions = []
+    target_predictions_by_token = {}
     drift_rows = []
     history_by_scene = {}
     active_scene = None
     with torch.no_grad():
         for index, data in enumerate(data_loader):
+            if index >= len(collection_infos):
+                raise ValueError('sequential data loader emitted more frames than selected')
             info = collection_infos[index]
             token = info.get('token')
             scene_token = info.get('scene_token')
@@ -338,7 +382,10 @@ def main():
             if scene_token != active_scene:
                 active_scene = scene_token
                 history_by_scene = {scene_token: []}
-            feature_data = scatter({'img': data['img']}, [device_index])[0]
+            feature_data = scatter(data, [device_index])[0]
+            batch_token, batch_scene_token = batch_token_and_scene(feature_data)
+            if (batch_token, batch_scene_token) != (token, scene_token):
+                raise ValueError('sequential data loader token/scene does not match selected frame order')
             full_features = detach_cpu_features(
                 model.extract_feat(_image_tensor(feature_data), T=1))
             result = parallel_model(return_loss=False, rescale=True, **data)
@@ -346,11 +393,16 @@ def main():
                 _assert_reuse_action(model)
                 drift_rows.append(record_target_drift(
                     token, scene_token, history_by_scene, full_features))
-                target_predictions.extend(_prediction_items(result))
+                if token in target_predictions_by_token:
+                    raise ValueError('collector observed a duplicate target prediction token')
+                target_predictions_by_token[token] = _prediction_items(result)
             history = history_by_scene[scene_token]
             history.append(full_features)
             del history[:-2]
 
+    if index + 1 != len(collection_infos):
+        raise ValueError('sequential data loader did not emit every selected frame')
+    target_predictions = order_target_predictions(selected_tokens, target_predictions_by_token)
     if len(drift_rows) != EXPECTED_TARGET_COUNT or len(target_predictions) != EXPECTED_TARGET_COUNT:
         raise ValueError('final target collection count is not {}'.format(EXPECTED_TARGET_COUNT))
     if {row['token'] for row in drift_rows} != target_tokens:

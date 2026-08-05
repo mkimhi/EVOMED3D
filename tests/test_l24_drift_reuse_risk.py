@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -16,6 +17,9 @@ from tools.l24_drift_reuse_risk import (
     validate_collection_manifest,
 )
 from tools.collect_l24_drift_reuse_risk import (
+    _assert_reuse_action,
+    batch_token_and_scene,
+    order_target_predictions,
     build_collection_manifest,
     record_target_drift,
 )
@@ -126,3 +130,31 @@ def test_manifest_marks_base_l24_and_naive_reuse_k2(tmp_path):
 def test_target_drift_rejects_cross_scene_or_short_history():
     with pytest.raises(ValueError, match='two full-L24 history frames'):
         record_target_drift('b-0', 'scene-b', {'scene-a': [feature(1.0)]})
+
+
+def test_target_requires_the_configured_naive_reuse_action():
+    controller = SimpleNamespace(
+        updater_name='reuse', policy=SimpleNamespace(partial_action='Lmiddle'),
+        last_action=None)
+    model = SimpleNamespace(temporal_memory_controller=controller)
+    with pytest.raises(ValueError, match='naive-reuse action'):
+        _assert_reuse_action(model)
+    controller.last_action = 'L8'
+    with pytest.raises(ValueError, match='naive-reuse action'):
+        _assert_reuse_action(model)
+    controller.last_action = 'Lmiddle'
+    _assert_reuse_action(model)
+
+
+def test_target_predictions_are_ordered_by_selected_tokens():
+    predictions = order_target_predictions(
+        ['first', 'second'], {'second': ['prediction-2'], 'first': ['prediction-1']})
+    assert predictions == ['prediction-1', 'prediction-2']
+
+
+def test_batch_metadata_must_match_the_expected_frame_identity():
+    assert batch_token_and_scene({
+        'img_metas': [[{'sample_idx': 'sample-1', 'scene_token': 'scene-1'}]],
+    }) == ('sample-1', 'scene-1')
+    with pytest.raises(ValueError, match='token and scene_token'):
+        batch_token_and_scene({'img_metas': [[{'sample_idx': 'sample-1'}]]})
