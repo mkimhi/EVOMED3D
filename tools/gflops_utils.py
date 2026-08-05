@@ -3,7 +3,43 @@ from collections import Counter
 
 EXPECTED_IMAGE_SHAPE = (1, 6, 3, 320, 800)
 IGNORED_UNSUPPORTED_OPS = {
+    'aten::__iand__',
+    'aten::add',
+    'aten::add_',
+    'aten::all',
+    'aten::atan2',
+    'aten::clone',
+    'aten::cos',
+    'aten::cumsum',
+    'aten::div',
+    'aten::exp',
+    'aten::eye',
+    'aten::gelu',
+    'aten::le',
+    'aten::linspace',
+    'aten::log',
+    'aten::mean',
+    'aten::mul',
+    'aten::mul_',
+    'aten::nan_to_num',
+    'aten::neg',
+    'aten::ones_like',
+    'aten::pad',
+    'aten::pow',
+    'aten::prod',
+    'aten::repeat',
     'aten::reshape',
+    'aten::rsub',
+    'aten::sigmoid',
+    'aten::silu',
+    'aten::sin',
+    'aten::softmax',
+    'aten::sqrt',
+    'aten::squeeze_',
+    'aten::sub',
+    'aten::sum',
+    'aten::topk',
+    'aten::upsample_bicubic2d',
     'aten::view',
     'aten::permute',
     'aten::transpose',
@@ -15,6 +51,26 @@ IGNORED_UNSUPPORTED_OPS = {
     'aten::squeeze',
     'aten::detach',
 }
+
+
+def flash_attention_macs(q_shape, kv_shape, cu_q_shape):
+    total_q, heads, head_dim = (int(value) for value in q_shape)
+    total_k = int(kv_shape[0])
+    batch = int(cu_q_shape[0]) - 1
+    if batch < 1 or total_q % batch or total_k % batch:
+        raise ValueError('invalid packed flash-attention shapes')
+    query_length = total_q // batch
+    key_length = total_k // batch
+    return 2 * batch * heads * query_length * key_length * head_dim
+
+
+def deformable_attention_macs(value_shape, sampling_shape):
+    batch, queries, groups, levels, points, coordinates = (
+        int(value) for value in sampling_shape)
+    if coordinates != 2 or int(value_shape[0]) != batch:
+        raise ValueError('invalid deformable-attention shapes')
+    group_dim = int(value_shape[3])
+    return 5 * batch * queries * groups * levels * points * group_dim
 
 
 def macs_to_gflops(macs):

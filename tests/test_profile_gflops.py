@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+import subprocess
 
 import pytest
 import torch
@@ -32,6 +33,16 @@ def test_cli_defaults(tmp_path):
         'config.py', 'model.pth', '--output-dir', str(tmp_path)])
     assert (args.device, args.num_samples, args.forced_action) == (
         'cuda:0', 1, None)
+
+
+def test_script_help_runs_from_repo_root():
+    script = Path(__file__).resolve().parents[1] / 'tools/profile_gflops.py'
+    result = subprocess.run(
+        [sys.executable, str(script), '--help'],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_frame_record_preserves_provenance():

@@ -3,12 +3,21 @@ import argparse
 from contextlib import nullcontext
 import json
 from pathlib import Path
+import sys
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from fvcore.nn import FlopCountAnalysis
+from fvcore.nn.jit_handles import get_shape
 import torch
 from torch import nn
 
 from tools.gflops_utils import (
+    deformable_attention_macs,
+    flash_attention_macs,
     macs_to_gflops,
     summarize_frames,
     validate_input_shape,
@@ -57,6 +66,12 @@ def analyze_module(module, inputs, image_shape):
     shape = validate_input_shape(image_shape)
     analysis = FlopCountAnalysis(module, inputs)
     analysis.tracer_warnings('none')
+    analysis.set_op_handle(
+        'prim::PythonOp.FlashAttnVarlenKVPackedFunc',
+        _flash_attention_handle,
+        'prim::PythonOp.MultiScaleDeformableAttnFunction',
+        _deformable_attention_handle,
+    )
     macs = float(analysis.total())
     unsupported = dict(analysis.unsupported_ops())
     validate_unsupported_ops(unsupported)
@@ -67,6 +82,21 @@ def analyze_module(module, inputs, image_shape):
         'unsupported_ops': unsupported,
         'by_operator_macs': dict(analysis.by_operator()),
     }
+
+
+def _flash_attention_handle(inputs, _outputs):
+    return flash_attention_macs(
+        get_shape(inputs[0]),
+        get_shape(inputs[1]),
+        get_shape(inputs[2]),
+    )
+
+
+def _deformable_attention_handle(inputs, _outputs):
+    return deformable_attention_macs(
+        get_shape(inputs[0]),
+        get_shape(inputs[3]),
+    )
 
 
 def frame_record(index, token, scene_token, requested_action,
