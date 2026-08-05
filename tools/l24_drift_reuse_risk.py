@@ -196,6 +196,51 @@ def build_panel_summary(frame: pd.DataFrame, repetitions: int, seed: int):
             pd.DataFrame(correlations))
 
 
+def validate_target_tables(selection: pd.DataFrame, drift: pd.DataFrame, predictions,
+                           expected_scenes: int = 100, targets_per_scene: int = 20):
+    """Validate exact collector token coverage before any ground-truth lookup."""
+    expected_targets = expected_scenes * targets_per_scene
+    required_selection = {'token', 'scene_token'}
+    required_drift = {'token', 'scene_token', 'drift_dt1', 'drift_dt2'}
+    missing = required_selection - set(selection.columns)
+    if missing:
+        raise ValueError('selection.csv missing columns: {}'.format(sorted(missing)))
+    missing = required_drift - set(drift.columns)
+    if missing:
+        raise ValueError('full_l24_drift.csv missing columns: {}'.format(sorted(missing)))
+    if len(selection) != expected_targets or selection['token'].nunique() != expected_targets:
+        raise ValueError('collector selection must contain exactly {} unique target tokens'.format(
+            expected_targets))
+    scene_sizes = selection.groupby('scene_token').size()
+    if (len(scene_sizes) != expected_scenes or
+            not scene_sizes.eq(targets_per_scene).all()):
+        raise ValueError('collector selection must contain exactly {} targets per scene'.format(
+            targets_per_scene))
+    if len(drift) != expected_targets or drift['token'].duplicated().any():
+        raise ValueError('drift table must contain exactly {} unique target tokens'.format(
+            expected_targets))
+    if not isinstance(predictions, dict):
+        raise ValueError('results_nusc.json must contain a results mapping')
+    selection_tokens = set(selection['token'])
+    if set(drift['token']) != selection_tokens:
+        raise ValueError('drift token coverage does not exactly match selection.csv')
+    if set(predictions) != selection_tokens:
+        raise ValueError('prediction token coverage does not exactly match selection.csv')
+    selection_scenes = selection.set_index('token')['scene_token']
+    drift_scenes = drift.set_index('token')['scene_token'].reindex(selection_scenes.index)
+    if not selection_scenes.equals(drift_scenes):
+        raise ValueError('drift token-to-scene mapping does not exactly match selection.csv')
+    if not np.isfinite(drift[['drift_dt1', 'drift_dt2']].to_numpy(float)).all():
+        raise ValueError('drift table contains non-finite values')
+    merged = selection.merge(
+        drift[['token', 'scene_token', 'drift_dt1', 'drift_dt2']],
+        on=['token', 'scene_token'], how='inner', validate='one_to_one')
+    if len(merged) != expected_targets:
+        raise ValueError('selection/drift join must retain exactly {} targets'.format(
+            expected_targets))
+    return merged
+
+
 def validate_collection_manifest(manifest) -> Dict[str, Path]:
     """Validate Task 2 provenance and return its existing artifact paths."""
     required = {'representation_source', 'prediction_mode', 'keyframe_interval',

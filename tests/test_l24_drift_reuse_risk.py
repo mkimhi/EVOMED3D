@@ -101,6 +101,30 @@ def test_build_panel_summary_has_every_offset_outcome_pair():
     }
 
 
+def _valid_target_tables():
+    tokens = [f'scene-{scene:03d}-target-{target:02d}'
+              for scene in range(100) for target in range(20)]
+    scenes = [f'scene-{scene:03d}' for scene in range(100) for _ in range(20)]
+    selection = pd.DataFrame({'token': tokens, 'scene_token': scenes})
+    drift = selection.assign(drift_dt1=np.linspace(0.0, 1.0, len(selection)),
+                             drift_dt2=np.linspace(0.1, 1.1, len(selection)))
+    return selection, drift, {token: [] for token in tokens}
+
+
+def test_validate_target_tables_requires_exactly_twenty_targets_per_scene():
+    selection, drift, predictions = _valid_target_tables()
+    selection.loc[0, 'scene_token'] = 'scene-001'
+    with pytest.raises(ValueError, match='exactly 20 targets per scene'):
+        reuse_risk.validate_target_tables(selection, drift, predictions)
+
+
+def test_validate_target_tables_rejects_token_to_scene_mismatch_before_merge():
+    selection, drift, predictions = _valid_target_tables()
+    drift.loc[0, 'scene_token'] = 'wrong-scene'
+    with pytest.raises(ValueError, match='token-to-scene mapping'):
+        reuse_risk.validate_target_tables(selection, drift, predictions)
+
+
 def test_validate_collection_manifest_resolves_required_artifact_paths(tmp_path):
     paths = {name: tmp_path / f'{name}.csv' for name in ('selection', 'drift')}
     paths['predictions'] = tmp_path / 'results_nusc.json'
