@@ -47,24 +47,8 @@ $^{1}$Google Research \quad $^{2}$Technion}
 
 
 \begin{abstract}
-Deep vision-transformer backbones dominate the inference cost of
-multi-camera 3D detectors, although adjacent driving frames often
-require only limited changes to the detector's high-level scene
-representation. We introduce \method{}, which treats the
-detector-interface representation as recurrent temporal state and
-allocates transformer depth to each incoming frame. A full-depth
-action refreshes the state, whereas a partial action projects an
-intermediate transformer representation to the detector interface
-and applies a lightweight gated correction to the existing memory.
-A controller uses online ego-motion, previous detection summaries,
-memory state, and an early-feature change cue to choose among
-encoder blocks 8, 12, 16, and 24. Geometry-dependent detector
-encoding is recomputed from the current camera calibration and ego
-pose at every timestamp rather than being propagated through memory.
-
-On nuScenes, a DETR3D--EVA-02-L baseline obtains 61.90 NDS and
-53.10 mAP at 373.4 ms per frame. \method{} obtains 60.43 NDS and
-54.41 mAP at 189.6 ms, a $1.97\times$ speedup. These results indicate that temporal representation memory and adaptive encoder depth are complementary mechanisms for reducing
+Vision-Transformer (ViT) backbones dominate the inference cost of multi-camera 3D detectors, although adjacent driving frames often require only limited changes to the detector's high-level scene representation. We introduce \method{}, which treats the detector-interface representation as recurrent temporal state and allocates transformer depth to each incoming frame. A full-depth action refreshes the state, whereas a partial action projects an intermediate transformer representation to the detector interface and applies a lightweight gated correction to the existing memory. A controller uses online ego-motion and previews early-feature change cue to determine budget policy of encoder layers. Geometry-dependent detector encoding is recomputed from the current camera calibration and ego pose at every timestamp rather than being propagated through memory.
+On nuScenes, a DETR3D--EVA-2-L baseline obtains 61.90 NDS and 53.10 mAP at 373.4 ms per frame. \method{} obtains 60.43 NDS and 54.41 mAP at 189.6 ms, a $1.97\times$ speedup. These results indicate that temporal representation memory and adaptive encoder depth are complementary mechanisms for reducing
 repeated computation in streaming 3D detection.
 \end{abstract}
 
@@ -276,7 +260,7 @@ M_t^s &= M_{t-1}^s+
 Here, $W_g^s$ and $W_r^s$ are $1\times1$ convolutions and
 $\alpha_s$ is a learned residual scale initialized to zero. The
 depth-specific projectors learn to express L8, L12, and L16 features
-in a common detector-interface space, while the shared updater
+in a common detector-interface space, while the shared updater \mk{NEED TO REPLACE THIS NAME}
 determines where and how strongly that representation should correct
 the previous memory. The gate can preserve stable content and
 suppress stale memory when the current partial representation
@@ -457,10 +441,15 @@ randomized, and cyclic schedules at matched action frequencies,
 showing that frame-dependent depth allocation contributes beyond
 average encoder depth.
 
+We report end-to-end GFLOPs per six-camera timestamp at
+$320\times800$ and batch size 1, counting one multiply--add as two
+floating-point operations. Dynamic-policy costs are validation-set
+averages that include scene-start and forced full-depth refreshes.
+
 \begin{table*}[t]
 \centering
 \small
-\caption{Comparison of accuracy, latency, and inference speedup on the nuScenes validation set ($320\times800$). We compare \method{} against recent state-of-the-art spatial token compression architectures. To ensure a fair evaluation, we group methods by their baseline architecture and report their relative speedup against their own dense full-encoding baseline. \method{}-$\mathrm{Fast}$ reset the memory every 5 frames}
+\caption{Comparison of accuracy, compute, latency, and inference speedup on the nuScenes validation set ($320\times800$). We compare \method{} against recent state-of-the-art spatial token compression architectures. To ensure a fair evaluation, we group methods by their baseline architecture and report their relative speedup against their own dense full-encoding baseline. \method{}-$\mathrm{Fast}$ resets the memory every 5 frames. Related methods use the StreamPETR baseline~\cite{wang2023streampetr}; n/r denotes that the primary source does not report a comparable absolute GFLOP count.}
 \label{tab:main-results}
 \begin{tabular}{llccrrr}
 \toprule
@@ -468,20 +457,20 @@ Method & Compression Paradigm & NDS & mAP & GFLOPs & Latency (ms) & Speedup \\
 \midrule
 \multicolumn{7}{c}{\textit{Spatial Token Compression SOTA (on StreamPETR ViT-L Baseline)}} \\
 \midrule
-Dense Baseline \cite{wang2023streampetr} & None (Full Encoding) & 60.80 & 52.10 & - & 454.5 & 1.00$\times$ \\
-ToC3D-Fast \cite{zhang2024toc3d} & Spatial Token Routing & 61.00 & 52.30 & - & 400.0 & 1.14$\times$ \\
-ToC3D-Faster \cite{zhang2024toc3d} & Spatial Token Routing & 60.90 & 51.70 & - & 322.6 & 1.41$\times$ \\
-SToRe3D-1/3 \cite{store3d} & Spatial Routing + Buffer & 60.90 & 52.30 & - & 285.7 & 1.59$\times$ \\
-SToRe3D-1/10 \cite{store3d} & Spatial Routing + Buffer & 60.70 & 52.10 & - & 192.3 & 2.36$\times$ \\
+StreamPETR\cite{wang2023streampetr} & None (Full Encoding) & 60.80 & 52.10 & 4601 & 454.5 & 1.00$\times$ \\
+ToC3D-Fast \cite{zhang2024toc3d} & Spatial Token Routing & 61.00 & 52.30 & n/r & 400.0 & 1.14$\times$ \\
+ToC3D-Faster \cite{zhang2024toc3d} & Spatial Token Routing & 60.90 & 51.70 & 3131 & 322.6 & 1.41$\times$ \\
+SToRe3D-1/3 \cite{store3d} & Spatial Routing + Buffer & 60.90 & 52.30 & n/r & 285.7 & 1.59$\times$ \\
+SToRe3D-1/10 \cite{store3d} & Spatial Routing + Buffer & 60.70 & 52.10 & n/r & 192.3 & 2.36$\times$ \\
 \midrule
 \multicolumn{7}{c}{\textit{Temporal Depth Allocation (Ours on DETR3D EVA-02-L Baseline)}} \\
 \midrule
-Dense Baseline & None (Full L24 Encoding) & \textbf{61.90} & \underline{53.10} & - & 373.4 & 1.00$\times$ \\
-Naive reuse (fixed) & Stale Memory (No Backbone) & 36.58 & 21.48 & - & \textbf{154.8} & 2.41$\times$ \\
-Variable schedule & Temporal (Cyclic L8/12/16/24) & 59.30 & 50.05 & - & 206.3 & 1.81$\times$ \\
+DETR3D + memory & None (Full L24 Encoding) & \textbf{61.90} & \underline{53.10} & 5161.8 & 373.4 & 1.00$\times$ \\
+Naive reuse (fixed) & Stale Memory (No Backbone) & 36.58 & 21.48 & 1809.0 & \textbf{154.8} & 2.41$\times$ \\
+Variable schedule & Temporal (Cyclic L8/12/16/24) & 59.30 & 50.05 & 3562.9 & 206.3 & 1.81$\times$ \\
 \midrule
-\method{}-$\mathrm{Acc}$ & Temporal (Auto-reg Policy) & \underline{60.43} & \textbf{54.41} & - & 195.7 & 1.91$\times$ \\
-\method{}-$\mathrm{Fast}$ & Temporal (Auto-reg Policy) & \underline{60.43} & 51.37 & - & \underline{189.6} & \underline{1.97$\times$} \\
+\method{}-$\mathrm{Acc}$ & Temporal (Auto-reg Policy) & \underline{60.43} & \textbf{54.01} & 4229.3 & 195.7 & 1.91$\times$ \\
+\method{}-$\mathrm{Fast}$ & Temporal (Auto-reg Policy) & \underline{60.43} & 51.37 & 4440.8 & \underline{189.6} & \underline{1.97$\times$} \\
 \bottomrule
 \end{tabular}
 \end{table*}
@@ -490,22 +479,23 @@ Variable schedule & Temporal (Cyclic L8/12/16/24) & 59.30 & 50.05 & - & 206.3 & 
 \begin{table*}[t]
 \centering
 \small
-\caption{nuScenes validation accuracy, computational cost, and measured latency at $320\times800$. Partial-only discards memory on non-full frames. Fixed update fuses the current partial feature with memory. Latency (ms) provides a precise measurement of inference time, while GFLOPs isolate theoretical compute. Speedup is relative to the 373.4 ms full-encoding baseline.}
+\caption{nuScenes validation accuracy, computational cost, and measured latency at $320\times800$. Partial-only discards memory on non-full frames. Fixed update fuses the current partial feature with memory. Dynamic GFLOPs are complete validation-set averages. Speedup is relative to the 373.4 ms full-encoding baseline.}
 \label{tab:policy_ablation}
 \begin{tabular}{lcrrrrr}
 \toprule
 Method & Depth choice  & NDS & mAP & GFLOPs & Latency (ms) & Speedup \\
 \midrule
-Full encoding & L24 &  \textbf{61.90} & \textbf{53.10} & & 373.4 & 1.00$\times$ \\
-Naive reuse & fixed interval & 36.58 & 21.48 & & \textbf{154.8} & 2.41$\times$ \\
+DETR3D & L24 &  60.80 & 52.1 & 5161.8 & 373.4 & 1.00$\times$ \\
+DETR3D + memory & L24 &  \textbf{61.90} & \textbf{53.10} & 5161.8 & 373.4 & 1.00$\times$ \\
+Naive reuse & fixed interval & 36.58 & 21.48 & 1809.0 & \textbf{154.8} & 2.41$\times$ \\
 \midrule
-Partial only & L8 &  47.14 & 38.43 & & 161.9 & 2.31$\times$ \\
-Partial+memory & L8  & 55.75 & 45.59 & & 163.5 & 2.28$\times$ \\
-Partial+memory & L12  & 59.46 & 50.55 & & 197.9 & 1.89$\times$ \\
-Partial+memory & L16  & 60.81 & 51.96 & & 236.1 & 1.58$\times$ \\
-Variable schedule & L8/L12/L16/L24  & 59.30 & 50.05 & & 206.3 & 1.81$\times$ \\
+Partial only & L8 &  47.14 & 38.43 & 3176.9 & 161.9 & 2.31$\times$ \\
+Partial+memory & L8  & 55.75 & 45.59 & 3220.7 & 163.5 & 2.28$\times$ \\
+Partial+memory & L12  & 59.46 & 50.55 & 3759.5 & 197.9 & 1.89$\times$ \\
+Partial+memory & L16  & 60.81 & 51.96 & 4298.3 & 236.1 & 1.58$\times$ \\
+Variable schedule & L8/L12/L16/L24  & 59.30 & 50.05 & 3562.9 & 206.3 & 1.81$\times$ \\
 \midrule
-\method{}-$\mathrm{Acc}$ & policy: L8/L12/L16/L24  & \underline{60.43} & \underline{54.41} & & 195.7 & 1.91$\times$ \\
+\method{}-$\mathrm{Acc}$ & policy: L8/L12/L16/L24  & \underline{60.43} & \textbf{54.01} & 4229.3 & 195.7 & 1.91$\times$ \\
 \bottomrule
 \end{tabular}
 \end{table*}
@@ -516,6 +506,16 @@ mAP in this run, while its lower NDS indicates degradation in one or
 more of the nuScenes true-positive error terms. We therefore treat it
 as a distinct accuracy--latency operating point rather than claiming
 uniform improvement over full encoding.
+
+The complete policy histograms also separate learned from forced full
+encoding. The accuracy setting selects L24 on 2,165 frames, in addition
+to 790 age-forced and 150 scene-start refreshes. The fast setting selects
+L24 on 3,141 frames, in addition to 402 age-forced and 150 scene-start
+refreshes. Thus, full-depth actions are predominantly policy decisions,
+not merely reset events. The fast setting nevertheless has higher
+GFLOPs than the accuracy setting while its recorded wall-clock latency is
+lower; we therefore report compute and latency independently and do not
+interpret their ordering as a controlled kernel-level comparison.
 
 \begin{figure*}[t]
     \centering
@@ -533,25 +533,44 @@ At L8, adding the gated update raises NDS from 55.75 to 58.23 and mAP from 45.59
 \begin{table}[t]
 \centering
 \small
-\caption{Updater ablation with L8 partial features and the same fixed full-encoding schedule.}
+\caption{Updater ablation with L8 partial features and the same fixed full-encoding schedule. GFLOPs average both full and non-full frames over the complete validation schedule.}
 \label{tab:updater-ablation}
 \resizebox{\columnwidth}{!}{%
-\begin{tabular}{lrrr}
+\begin{tabular}{lrrrr}
 \toprule
-Non-full-frame operation & NDS & mAP & FPS \\
+Non-full-frame operation & NDS & mAP & GFLOPs & FPS \\
 \midrule
-Partial only & 55.75 & 45.59 & 6.12 \\
-Gated residual & \textbf{58.23} & \textbf{48.98} & \textbf{6.12} \\
-Cross-attention & 54.33 & 43.58 & 5.95 \\
-Gated cross-attention & 57.61 & 48.30 & 5.91 \\
-Per-camera attention & 55.04 & 44.30 & 5.99 \\
-Inverted attention & 52.91 & 42.49 & 5.90 \\
-Gated residual + distillation & 58.08 & 48.69 & 6.12 \\
+Partial only & 55.75 & 45.59 & 3176.9 & 6.12 \\
+Gated residual & \textbf{58.23} & \textbf{48.98} & 3220.7 & \textbf{6.12} \\
+Cross-attention & 54.33 & 43.58 & 3230.4 & 5.95 \\
+Gated cross-attention & 57.61 & 48.30 & 3252.3 & 5.91 \\
+Per-camera attention & 55.04 & 44.30 & 3213.4 & 5.99 \\
+Inverted attention & 52.91 & 42.49 & 3230.4 & 5.90 \\
+Gated residual + distillation & 58.08 & 48.69 & 3220.7 & 6.12 \\
 \bottomrule
 \end{tabular}}
 \end{table}
 
 The simple gated residual updater outperforms every attention variant. Attention adds 2--4\% latency and does not recover accuracy. Feature distillation changes NDS by $-0.15$ and mAP by $-0.29$ relative to the undistilled gate. These negative results favor a small updater: saved backbone computation should not be replaced by a costly temporal module.
+
+
+
+\begin{table*}
+\centering
+\small
+\caption{Detailed 3D detection metrics and true-positive errors on the nuScenes validation set. We compare the full-encoding with and without memory encoded features, and the proposed policy \method{}. $\uparrow$ indicates higher is better, and $\downarrow$ indicates lower is better.}
+\label{tab:detailed_metrics}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{l c c c c c c c}
+\toprule
+Method & NDS $\uparrow$ & mAP $\uparrow$ & mATE $\downarrow$ & mASE $\downarrow$ & mAOE $\downarrow$ & mAVE $\downarrow$ & mAAE $\downarrow$ \\
+\midrule
+DETR3D  & 0.6081 & 0.5196 & 0.5420 & 0.2578 & 0.2809 & 0.2440 & 0.1922 \\
+DETR3D-MEM & 0.6189 & 0.5310 & 0.5209 & 0.2514 & 0.2596 & 0.2353 & 0.1989 \\
+\method{} & 0.6057 & 0.5401 & 0.5439 & 0.2564 & 0.2771 & 0.2421 & 0.1932 \\
+\bottomrule
+\end{tabular}}
+\end{table*}
 
 
 \subsection{Policy Training and Input Ablations}
@@ -564,7 +583,7 @@ Current-frame annotation features do not provide a useful oracle advantage in th
 
 An early feature is not merely a cheaper substitute for a final feature. Its best use here is as a current-frame correction to high-level memory. This explains why L8 updating improves substantially over L8 partial-only inference at the same measured throughput.
 
-The policy adds value by selecting where to spend semantic depth. Fixed schedules vary compute with frame index but cannot react to motion or scene change. The improvement over the cyclic schedule suggests that frame-dependent allocation matters beyond average depth. Action-frequency logs are still needed for a strict compute-matched decomposition.
+The policy adds value by selecting where to spend semantic depth. Fixed schedules vary compute with frame index but cannot react to motion or scene change. The improvement over the cyclic schedule suggests that frame-dependent allocation matters beyond average depth. The measured action histograms establish realized compute; a randomized schedule matched to the same histogram remains necessary for a strict allocation-only decomposition.
 
 A shallow probe predicts feature similarity accurately, but it is useful only if its cost and subsequent action improve end-to-end detection. Our strongest detector uses previous predictions rather than a current L8 cascade. The probe analysis is therefore evidence for a promising policy input, not an end-to-end speedup claim.
 
@@ -584,7 +603,7 @@ motion can still require an early full refresh.
 
 Autoregressive policy conditioning introduces a distribution shift because previous ground-truth summaries are used during training, whereas previous network predictions are used at inference. Absolute ego pose also appears in the current online vector and may encode route-specific correlations.
 
-Throughput values are single-run averages. The profiler synchronizes CUDA around measured regions, but the repository lacks a complete publication protocol with warm-up count, percentile latency, preprocessing boundaries, and confidence intervals. Some probe experiments assume overlap with next-frame processing and are excluded from headline claims. Peak GPU memory, FLOPs, action frequencies, and high-motion failure subsets remain unreported.
+Throughput values are single-run averages. The profiler synchronizes CUDA around measured regions, but the repository lacks a complete publication protocol with warm-up count, percentile latency, preprocessing boundaries, and confidence intervals. Some probe experiments assume overlap with next-frame processing and are excluded from headline claims. Peak GPU memory and high-motion failure subsets remain unreported; GFLOPs follow the protocol above, and complete action frequencies are reported for headline learned-policy rows.
 
 \section{Conclusion}
 
@@ -633,24 +652,24 @@ The controller bounds consecutive partial updates by forcing a full encoding aft
 \begin{table*}[t]
 \centering
 \scriptsize
-\caption{Completed policy experiments. Accuracy is from validation logs where available; timing is from the experiment ledger. GT inputs denote oracle inference. Autoregressive (Auto-reg) models use previous GT summaries during training and previous predictions at inference. Max age is an implementation safeguard.}
+\caption{Completed policy experiments. Accuracy is from validation logs where available; timing is from the experiment ledger. GT inputs denote oracle inference. Autoregressive (Auto-reg) models use previous GT summaries during training and previous predictions at inference. Max age is an implementation safeguard; n/r denotes a missing complete action histogram.}
 \label{tab:policy-extended}
 \resizebox{\textwidth}{!}{%
-\begin{tabular}{p{5.1cm}llllrrrr}
+\begin{tabular}{p{5.1cm}llllrrrrr}
 \toprule
-Policy variant & Inference input & Actions & Max age & Deployable & NDS & mAP & FPS & ms \\
+Policy variant & Inference input & Actions & Max age & Deployable & NDS & mAP & GFLOPs & FPS & ms \\
 \midrule
-Exported 3-level MLP$^{\dagger}$ & online metadata & 8/12/24 & none & yes & 52.60 & 40.27 & 4.15$^{\dagger}$ & 312$^{\dagger}$ \\
-Trainable 4-level MLP & online metadata & 8/12/16/24 & none & yes & 55.21 & 44.86 & 4.41 & 226.91 \\
-Trainable 4-level MLP & online metadata & 8/12/16/24 & 5 & yes & 57.94 & 48.57 & 4.74 & 212.28 \\
-Current-GT oracle & current annotations & 8/12/16/24 & 5 & no & 57.17 & 47.24 & 4.71 & 212.18 \\
-Previous-GT oracle, shorter training & previous annotations & 8/12/16/24 & 3 & no & 58.57 & 49.13 & 4.88 & 204.98 \\
-Hand-set shallow-drift policy & previous L8 drift & 8/12/16/24 & 4 & yes & 55.65 & 43.86 & 3.49 & 286.66 \\
-Trainable MLP + previous L12$^{\ddagger}$ & online + previous L12 & 8/12/16/24 & none & qualified & 55.18 & 44.83 & 4.30 & 232.30 \\
-Previous-GT oracle & previous annotations & 8/12/16/24 & 5 & no & 57.38 & 47.48 & 4.60 & 217.22 \\
-Auto-reg prediction features & previous predictions & 8/12/16/24 & 5 & yes & 60.05 & 50.61 & 5.17 & 193.35 \\
-Auto-reg, hard-aware labels & previous predictions & 8/12/16/24 & 5 & yes & \textbf{60.43} & \textbf{51.37} & \textbf{5.27} & \textbf{189.58} \\
-Auto-reg, shorter max age & previous predictions & 8/12/16/24 & 4 & yes & 60.43 & 51.23 & 5.11 & 195.71 \\
+Exported 3-level MLP$^{\dagger}$ & online metadata & 8/12/24 & none & yes & 52.60 & 40.27 & n/r & 4.15$^{\dagger}$ & 312$^{\dagger}$ \\
+Trainable 4-level MLP & online metadata & 8/12/16/24 & none & yes & 55.21 & 44.86 & n/r & 4.41 & 226.91 \\
+Trainable 4-level MLP & online metadata & 8/12/16/24 & 5 & yes & 57.94 & 48.57 & n/r & 4.74 & 212.28 \\
+Current-GT oracle & current annotations & 8/12/16/24 & 5 & no & 57.17 & 47.24 & n/r & 4.71 & 212.18 \\
+Previous-GT oracle, shorter training & previous annotations & 8/12/16/24 & 3 & no & 58.57 & 49.13 & n/r & 4.88 & 204.98 \\
+Hand-set shallow-drift policy & previous L8 drift & 8/12/16/24 & 4 & yes & 55.65 & 43.86 & n/r & 3.49 & 286.66 \\
+Trainable MLP + previous L12$^{\ddagger}$ & online + previous L12 & 8/12/16/24 & none & qualified & 55.18 & 44.83 & n/r & 4.30 & 232.30 \\
+Previous-GT oracle & previous annotations & 8/12/16/24 & 5 & no & 57.38 & 47.48 & n/r & 4.60 & 217.22 \\
+Auto-reg prediction features & previous predictions & 8/12/16/24 & 5 & yes & 60.05 & 50.61 & n/r & 5.17 & 193.35 \\
+Auto-reg, hard-aware labels & previous predictions & 8/12/16/24 & 5 & yes & \textbf{60.43} & \textbf{51.37} & 4440.8 & \textbf{5.27} & \textbf{189.58} \\
+Auto-reg, shorter max age & previous predictions & 8/12/16/24 & 4 & yes & 60.43 & 51.23 & 4229.3 & 5.11 & 195.71 \\
 \bottomrule
 \end{tabular}}
 
@@ -686,18 +705,18 @@ On 5,448 frames with previous signals, online metadata plus previous L12 drift o
 \caption{Fixed-frequency and partial-depth records.}
 \label{tab:fixed-extended}
 \resizebox{\columnwidth}{!}{%
-\begin{tabular}{lrrrr}
+\begin{tabular}{lrrrrr}
 \toprule
-Method & NDS & mAP & FPS & ms \\
+Method & NDS & mAP & GFLOPs & FPS & ms \\
 \midrule
-Full encoding every frame & 61.90 & 53.10 & 2.68 & 373.37 \\
-Naive reuse, every 2 frames & 44.40 & 31.81 & 4.48 & 206.73 \\
-Naive reuse, every 3 frames & 36.58 & 21.48 & 6.46 & 154.82 \\
-Partial only, L8 & 55.75 & 45.59 & 6.12 & 161.92 \\
-Partial only, L12 & 59.46 & 50.55 & 5.07 & 197.90 \\
-Partial only, L16 & 60.81 & 51.96 & 4.24 & 236.08 \\
-Fixed gated update, L8 & 58.23 & 48.98 & 6.12 & 163.50 \\
-Variable-depth cycle & 59.30 & 50.05 & 4.85 & 206.29 \\
+Full encoding every frame & 61.90 & 53.10 & 5161.8 & 2.68 & 373.37 \\
+Naive reuse, every 2 frames & 44.40 & 31.81 & 2622.3 & 4.48 & 206.73 \\
+Naive reuse, every 3 frames & 36.58 & 21.48 & 1809.0 & 6.46 & 154.82 \\
+Partial only, L8 & 55.75 & 45.59 & 3176.9 & 6.12 & 161.92 \\
+Partial only, L12 & 59.46 & 50.55 & 3715.8 & 5.07 & 197.90 \\
+Partial only, L16 & 60.81 & 51.96 & 4254.6 & 4.24 & 236.08 \\
+Fixed gated update, L8 & 58.23 & 48.98 & 3220.7 & 6.12 & 163.50 \\
+Variable-depth cycle & 59.30 & 50.05 & 3562.9 & 4.85 & 206.29 \\
 \bottomrule
 \end{tabular}}
 \end{table}
@@ -706,13 +725,13 @@ Variable-depth cycle & 59.30 & 50.05 & 4.85 & 206.29 \\
 
 \section{Qualitative Evaluation}
 
-\begin{figure*}[t]
-    \centering
-    \fcolorbox{red}{white}{\parbox{0.94\textwidth}{\centering\color{red}
-    \textbf{Manual qualitative figure placeholder.} Select three nuScenes sequences: stable cruising, a sharp ego turn, and dense traffic with new objects. Show four timestamps with camera predictions, bird's-eye-view boxes, selected action, policy confidence, and memory age. Add one failure case where the policy exits too early and misses a newly visible nearby object.}}
-    \caption{Requested qualitative comparison of policy decisions and 3D predictions across temporal regimes.}
-    \label{fig:qualitative}
-\end{figure*}
+% \begin{figure*}[t]
+%     \centering
+%     \fcolorbox{red}{white}{\parbox{0.94\textwidth}{\centering\color{red}
+%     \textbf{Manual qualitative figure placeholder.} Select three nuScenes sequences: stable cruising, a sharp ego turn, and dense traffic with new objects. Show four timestamps with camera predictions, bird's-eye-view boxes, selected action, policy confidence, and memory age. Add one failure case where the policy exits too early and misses a newly visible nearby object.}}
+%     \caption{Requested qualitative comparison of policy decisions and 3D predictions across temporal regimes.}
+%     \label{fig:qualitative}
+% \end{figure*}
 
 \subsection{Which Signals Predict Required Depth?}
 
@@ -795,41 +814,41 @@ including lagged L8 drift. Current-frame L8 similarity is reported
 separately as a cascade upper bound rather than as an input to the
 headline policy.
 
-Replace the current policy table with a structure like:
 
-\begin{table*}[t]
-\centering
-\small
-\caption{\mk{need to review and add real numbers, this is approximationv}Policy and control ablations. All learned policies use the
-same memory updater. Lagged L8 uses cached features from frames
-$t-2$ and $t-1$ and therefore requires no current-frame probe.
-Average depth and full-action frequency expose differences in compute
-allocation beyond measured latency.}
-\label{tab:policy-ablation}
-\begin{tabular}{lccccccccc}
-\toprule
-Policy variant &
-Prev. det. &
-Lagged L8 &
-Scene age &
-Max age &
-Avg. depth &
-L24 (\%) &
-NDS &
-mAP &
-ms \\
-\midrule
-Cyclic schedule            & -- & -- & -- & \rednote{} & \rednote{} & \rednote{} & 59.30 & 50.05 & 206.3 \\
-Random, matched actions     & -- & -- & -- & \rednote{} & \rednote{} & \rednote{} & \rednote{} & \rednote{} & \rednote{} \\
-Metadata only               &    &    & \checkmark & $\infty$ & \rednote{} & \rednote{} & 55.21 & 44.86 & 226.9 \\
-Metadata + bounded age      &    &    & \checkmark & 5 & \rednote{} & \rednote{} & 57.94 & 48.57 & 212.3 \\
-+ previous detections       & \checkmark &    & \checkmark & 5 & \rednote{} & \rednote{} & 60.05 & 50.61 & 193.4 \\
-+ lagged L8 drift           & \checkmark & \checkmark & \checkmark & 5 & \rednote{} & \rednote{} & \rednote{} & \rednote{} & \rednote{} \\
-+ hard-aware supervision    & \checkmark & \checkmark & \checkmark & 5 & \rednote{} & \rednote{} & 60.43 & 51.37 & 189.6 \\
-\method{} accuracy setting  & \checkmark & \checkmark & \checkmark & \rednote{} & \rednote{} & \rednote{} & 60.43 & 54.41 & 195.7 \\
-\bottomrule
-\end{tabular}
-\end{table*}
+
+% \begin{table*}[t]
+% \centering
+% \small
+% \caption{\mk{need to review and add real numbers, this is approximationv}Policy and control ablations. All learned policies use the
+% same memory updater. Lagged L8 uses cached features from frames
+% $t-2$ and $t-1$ and therefore requires no current-frame probe.
+% Average depth and full-action frequency expose differences in compute
+% allocation beyond measured latency.}
+% \label{tab:policy-ablation}
+% \begin{tabular}{lccccccccc}
+% \toprule
+% Policy variant &
+% Prev. det. &
+% Lagged L8 &
+% Scene age &
+% Max age &
+% Avg. depth &
+% L24 (\%) &
+% NDS &
+% mAP &
+% ms \\
+% \midrule
+% Cyclic schedule            & -- & -- & -- & \rednote{} & \rednote{} & \rednote{} & 59.30 & 50.05 & 206.3 \\
+% Random, matched actions     & -- & -- & -- & \rednote{} & \rednote{} & \rednote{} & \rednote{} & \rednote{} & \rednote{} \\
+% Metadata only               &    &    & \checkmark & $\infty$ & \rednote{} & \rednote{} & 55.21 & 44.86 & 226.9 \\
+% Metadata + bounded age      &    &    & \checkmark & 5 & \rednote{} & \rednote{} & 57.94 & 48.57 & 212.3 \\
+% + previous detections       & \checkmark &    & \checkmark & 5 & \rednote{} & \rednote{} & 60.05 & 50.61 & 193.4 \\
+% + lagged L8 drift           & \checkmark & \checkmark & \checkmark & 5 & \rednote{} & \rednote{} & \rednote{} & \rednote{} & \rednote{} \\
+% + hard-aware supervision    & \checkmark & \checkmark & \checkmark & 5 & \rednote{} & \rednote{} & 60.43 & 51.37 & 189.6 \\
+% \method{} accuracy setting  & \checkmark & \checkmark & \checkmark & \rednote{} & \rednote{} & \rednote{} & 60.43 & 54.41 & 195.7 \\
+% \bottomrule
+% \end{tabular}
+% \end{table*}
 
 
 \begin{table}[t]
