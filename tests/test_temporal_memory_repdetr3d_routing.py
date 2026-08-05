@@ -556,6 +556,96 @@ def test_repdetr3d_policy_supervision_feature_noise_uses_policy_scale(monkeypatc
     assert noisy["count"] == 12.0
 
 
+def test_repdetr3d_policy_supervision_residual_noise_uses_exported_feature_std(monkeypatch):
+    from projects.mmdet3d_plugin.models.detectors.repdetr3d import RepDetr3D
+    from projects.mmdet3d_plugin.models.temporal_memory.policies import build_frame_policy
+
+    model = RepDetr3D.__new__(RepDetr3D)
+    torch.nn.Module.__init__(model)
+    model.training = True
+    model.temporal_memory = dict(
+        policy_supervision=dict(residual_noise_multiplier=1.0))
+    model.temporal_memory_policy = build_frame_policy(dict(
+        type="mlp",
+        checkpoint=None,
+        load_weights=False,
+        feature_names=["frame_number", "num_annotations"],
+        mean=[0.0, 0.0],
+        scale=[1.0, 1.0],
+    ))
+    model.temporal_memory_policy.teacher_forcing_residual_std = torch.as_tensor([0.0, 2.0])
+    monkeypatch.setattr(torch, "randn", lambda *args, **kwargs: torch.ones(*args, **kwargs))
+
+    noisy = model._temporal_memory_noisy_policy_features(
+        {"frame_number": 3.0, "num_annotations": 7.0})
+
+    assert noisy["frame_number"] == 3.0
+    assert noisy["num_annotations"] == 9.0
+
+
+def test_repdetr3d_counterfactual_supervision_does_not_require_teacher():
+    from projects.mmdet3d_plugin.models.detectors.repdetr3d import RepDetr3D
+
+    model = RepDetr3D.__new__(RepDetr3D)
+    model.temporal_memory = dict(
+        policy_supervision=dict(target="counterfactual_action"))
+
+    assert model._temporal_memory_policy_supervision_requires_teacher() is False
+
+    model.temporal_memory["policy_supervision"]["target"] = "similarity"
+    assert model._temporal_memory_policy_supervision_requires_teacher() is True
+
+
+def test_repdetr3d_counterfactual_policy_supervision_uses_sample_token():
+    from projects.mmdet3d_plugin.models.detectors.repdetr3d import RepDetr3D
+    from projects.mmdet3d_plugin.models.temporal_memory.policies import build_frame_policy
+
+    class Targets:
+        def label_index(self, token, labels):
+            assert token == "sample-a"
+            assert labels == ["L8", "L12", "L16", "L24"]
+            return 2
+
+    model = RepDetr3D.__new__(RepDetr3D)
+    torch.nn.Module.__init__(model)
+    model.temporal_memory = dict(
+        policy_supervision=dict(target="counterfactual_action"))
+    model.temporal_memory_policy = build_frame_policy(dict(
+        type="mlp",
+        checkpoint=None,
+        load_weights=False,
+        feature_names=["speed"],
+        labels=["L8", "L12", "L16", "L24"],
+        actions={"L8": "L8", "L12": "L12", "L16": "L16", "L24": "L24"},
+    ))
+    model._tm_counterfactual_targets = Targets()
+    logits = model.temporal_memory_policy.logits({"speed": 1.0})
+    expected = torch.nn.functional.cross_entropy(
+        logits, torch.as_tensor([2], dtype=torch.long, device=logits.device))
+
+    loss = model._temporal_memory_policy_supervision_loss(
+        {"speed": 1.0, "_state": {"sample_token": "sample-a"}}, None, None)
+
+    assert torch.allclose(loss, expected)
+
+
+def test_repdetr3d_counterfactual_supervision_uses_explicit_step_window():
+    from projects.mmdet3d_plugin.models.detectors.repdetr3d import RepDetr3D
+
+    model = RepDetr3D.__new__(RepDetr3D)
+    model.temporal_memory = dict(policy_supervision=dict(
+        target="counterfactual_action", start_train_step=10, max_train_steps=100))
+
+    model._tm_train_step = 9
+    assert model._temporal_memory_policy_supervision_active() is False
+    model._tm_train_step = 10
+    assert model._temporal_memory_policy_supervision_active() is True
+    model._tm_train_step = 99
+    assert model._temporal_memory_policy_supervision_active() is True
+    model._tm_train_step = 100
+    assert model._temporal_memory_policy_supervision_active() is False
+
+
 def test_repdetr3d_policy_supervision_zero_loss_keeps_ddp_loss_key_when_no_pairs():
     from projects.mmdet3d_plugin.models.detectors.repdetr3d import RepDetr3D
 

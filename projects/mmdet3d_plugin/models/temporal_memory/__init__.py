@@ -4,6 +4,7 @@ from .memory_packet import MemoryPacket
 from .pe_handler import relative_ego_transform, transform_points
 from .partial_features import resolve_eva_layer_index
 from .policies import CycleFramePolicy, FixedIntervalFramePolicy, MlpFramePolicy, action_to_layer, build_frame_policy, layer_to_action
+from .policy_targets import CounterfactualActionTargets
 from .profiling import TemporalMemoryProfiler
 from .projectors import LayeredPartialFeatureProjector, PartialFeatureProjector
 from .controller import TemporalMemoryController
@@ -16,6 +17,7 @@ __all__ = [
     'DetectorAdapter',
     'DistillationLoss',
     'CycleFramePolicy',
+    'CounterfactualActionTargets',
     'FixedIntervalFramePolicy',
     'MlpFramePolicy',
     'GatedResidualMemoryUpdater',

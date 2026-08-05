@@ -92,6 +92,16 @@ class RepDetr3D(MVXTwoStageDetector):
         self._tm_policy_prev_prediction_features = None
         self._tm_policy_offline_lookup = self._load_tm_policy_offline_lookup(
             self.temporal_memory.get('policy_offline_csv', None))
+        self._tm_counterfactual_targets = None
+        policy_supervision = self.temporal_memory.get('policy_supervision', {}) or {}
+        if policy_supervision.get('target') == 'counterfactual_action':
+            from projects.mmdet3d_plugin.models.temporal_memory import (
+                CounterfactualActionTargets,
+            )
+            self._tm_counterfactual_targets = CounterfactualActionTargets(
+                policy_supervision.get('target_csv'),
+                token_column=policy_supervision.get('token_column', 'token'),
+                action_column=policy_supervision.get('action_column', 'oracle_action'))
         self.tm_profiler = None
         if self.tm_debug_latency:
             from projects.mmdet3d_plugin.models.temporal_memory import TemporalMemoryProfiler
@@ -312,16 +322,21 @@ class RepDetr3D(MVXTwoStageDetector):
             if self._temporal_memory_policy_needs_previous_l12_drift() and l12_features is None:
                 l12_features = self._extract_temporal_memory_policy_probe_features(frame_data, 'block12')
             policy_teacher = None
-            if self._temporal_memory_policy_supervision_active():
+            policy_supervision_active = self._temporal_memory_policy_supervision_active()
+            policy_requires_teacher = self._temporal_memory_policy_supervision_requires_teacher()
+            if policy_supervision_active and policy_requires_teacher:
                 with torch.no_grad():
                     policy_teacher = extract_full()
-                if getattr(self, '_tm_previous_full_teacher', None) is not None:
-                    policy_loss = self._temporal_memory_policy_supervision_loss(
-                        policy_features,
-                        self._tm_previous_full_teacher,
-                        policy_teacher)
-                    if policy_loss is not None:
-                        policy_losses.append(policy_loss)
+            previous_teacher = getattr(self, '_tm_previous_full_teacher', None)
+            if (
+                policy_supervision_active
+                and not policy_features['_state']['is_scene_start']
+                and (not policy_requires_teacher or previous_teacher is not None)
+            ):
+                policy_loss = self._temporal_memory_policy_supervision_loss(
+                    policy_features, previous_teacher, policy_teacher)
+                if policy_loss is not None:
+                    policy_losses.append(policy_loss)
             output = self.temporal_memory_controller.get_or_update(
                 extract_full,
                 scene_token=scene_token,
@@ -405,25 +420,32 @@ class RepDetr3D(MVXTwoStageDetector):
                 actions.append(action)
 
             policy_teacher = None
+            policy_supervision_active = self._temporal_memory_policy_supervision_active()
+            policy_requires_teacher = self._temporal_memory_policy_supervision_requires_teacher()
             if (
-                self._temporal_memory_policy_supervision_active()
+                (policy_supervision_active and policy_requires_teacher)
                 or getattr(self.temporal_memory_controller, 'train_with_teacher', False)
             ):
                 with torch.no_grad():
                     policy_teacher = self._squeeze_temporal_feature_dim(
                         self._profile_extract_full_features(
                             frame_data, len_queue=1, training_mode=True))
-            if self._temporal_memory_policy_supervision_active() and policy_teacher is not None:
+            if policy_supervision_active:
                 previous_teachers = getattr(self, '_tm_batch_previous_full_teacher', None)
                 if previous_teachers is None or len(previous_teachers) != batch_size:
                     previous_teachers = [None for _ in range(batch_size)]
                 for batch_index in range(batch_size):
                     previous_teacher = previous_teachers[batch_index]
-                    if previous_teacher is None or is_reset_frames[batch_index]:
+                    if (
+                        is_reset_frames[batch_index]
+                        or (policy_requires_teacher and previous_teacher is None)
+                    ):
                         continue
-                    current_teacher = self._temporal_memory_select_feature_batch(
-                        policy_teacher,
-                        torch.as_tensor([batch_index], dtype=torch.long))
+                    current_teacher = None
+                    if policy_requires_teacher:
+                        current_teacher = self._temporal_memory_select_feature_batch(
+                            policy_teacher,
+                            torch.as_tensor([batch_index], dtype=torch.long))
                     policy_loss = self._temporal_memory_policy_supervision_loss(
                         policy_features[batch_index],
                         previous_teacher,
@@ -640,16 +662,26 @@ class RepDetr3D(MVXTwoStageDetector):
         policy = getattr(self, 'temporal_memory_policy', None)
         if not isinstance(policy, torch.nn.Module) or not hasattr(policy, 'logits'):
             return None
-        score = self._temporal_memory_policy_target_score(previous_full, current_full)
         spec = self.temporal_memory.get('policy_supervision', {}) or {}
-        target_noise_std = float(spec.get('target_noise_std', 0.0) or 0.0)
-        if self.training and target_noise_std > 0.0:
-            score = score + torch.randn_like(score) * target_noise_std
-            clamp = spec.get('target_noise_clamp', (0.0, 1.0))
-            if clamp is not None:
-                low, high = clamp
-                score = score.clamp(float(low), float(high))
-        target_index = self._temporal_memory_policy_target_index(float(score.detach().cpu()))
+        if spec.get('target') == 'counterfactual_action':
+            state = policy_features.get('_state', {}) or {}
+            token = state.get('sample_token')
+            if not token:
+                raise KeyError('counterfactual policy supervision requires a sample token')
+            targets = getattr(self, '_tm_counterfactual_targets', None)
+            if targets is None:
+                raise RuntimeError('counterfactual policy targets were not loaded')
+            target_index = targets.label_index(token, policy.labels)
+        else:
+            score = self._temporal_memory_policy_target_score(previous_full, current_full)
+            target_noise_std = float(spec.get('target_noise_std', 0.0) or 0.0)
+            if self.training and target_noise_std > 0.0:
+                score = score + torch.randn_like(score) * target_noise_std
+                clamp = spec.get('target_noise_clamp', (0.0, 1.0))
+                if clamp is not None:
+                    low, high = clamp
+                    score = score.clamp(float(low), float(high))
+            target_index = self._temporal_memory_policy_target_index(float(score.detach().cpu()))
         logits = policy.logits(self._temporal_memory_noisy_policy_features(policy_features))
         target = torch.as_tensor([target_index], dtype=torch.long, device=logits.device)
         loss = F.cross_entropy(logits, target)
@@ -664,11 +696,31 @@ class RepDetr3D(MVXTwoStageDetector):
 
     def _temporal_memory_noisy_policy_features(self, policy_features):
         spec = self.temporal_memory.get('policy_supervision', {}) or {}
+        residual_noise_multiplier = float(
+            spec.get('residual_noise_multiplier', 0.0) or 0.0)
+        policy = getattr(self, 'temporal_memory_policy', None)
+        feature_names = getattr(policy, 'feature_names', None)
+        residual_std = getattr(policy, 'teacher_forcing_residual_std', None)
+        if (
+            self.training
+            and residual_noise_multiplier > 0.0
+            and feature_names
+            and residual_std is not None
+        ):
+            residual_std = residual_std.detach().float().cpu()
+            if residual_std.numel() != len(feature_names):
+                raise ValueError(
+                    'teacher-forcing residual std must match policy feature count')
+            noise = torch.randn(len(feature_names), dtype=residual_std.dtype)
+            noise = noise * residual_noise_multiplier * residual_std
+            noisy = dict(policy_features)
+            for index, name in enumerate(feature_names):
+                value = noisy.get(name, 0.0) or 0.0
+                noisy[name] = float(value) + float(noise[index])
+            return noisy
         feature_noise_std = float(spec.get('feature_noise_std', 0.0) or 0.0)
         if not self.training or feature_noise_std <= 0.0:
             return policy_features
-        policy = getattr(self, 'temporal_memory_policy', None)
-        feature_names = getattr(policy, 'feature_names', None)
         scale = getattr(policy, 'scale', None)
         if not feature_names or scale is None:
             return policy_features
@@ -680,17 +732,25 @@ class RepDetr3D(MVXTwoStageDetector):
             noisy[name] = float(value) + float(noise[index])
         return noisy
 
+    def _temporal_memory_policy_supervision_requires_teacher(self):
+        spec = self.temporal_memory.get('policy_supervision', {}) or {}
+        return spec.get('target', 'similarity') != 'counterfactual_action'
+
     def _temporal_memory_policy_supervision_active(self):
         spec = self.temporal_memory.get('policy_supervision', None)
         if not spec:
             return False
         if spec.get('enabled', True) is False:
             return False
+        step = getattr(self, '_tm_train_step', 0)
         max_steps = int(spec.get('max_train_steps', 0) or 0)
+        if 'start_train_step' in spec:
+            start_step = int(spec.get('start_train_step', 0) or 0)
+            return step >= start_step and (max_steps <= 0 or step < max_steps)
         warmup_ratio = float(spec.get('warmup_ratio', 0.1))
         if max_steps <= 0:
             return True
-        return getattr(self, '_tm_train_step', 0) < max(1, int(max_steps * warmup_ratio))
+        return step < max(1, int(max_steps * warmup_ratio))
 
     def _maybe_log_temporal_memory_policy_stats(self):
         if self.tm_profiler is None or self.tm_profiler.window_reports != 0:
@@ -979,6 +1039,10 @@ class RepDetr3D(MVXTwoStageDetector):
 
     def _temporal_memory_policy_features(self, img_metas, data, scene_token=None, l8_similarity=None):
         meta = img_metas[0] if img_metas and isinstance(img_metas[0], dict) else {}
+        sample_token = meta.get('token', meta.get('sample_idx', None))
+        if sample_token is None:
+            filename = meta.get('filename', None)
+            sample_token = filename[0] if isinstance(filename, (list, tuple)) and filename else filename
         frame_number = int(meta.get('frame_idx', getattr(self.temporal_memory_controller, 'frame_index', 0)))
         timestamp = self._tm_scalar(data.get('timestamp', meta.get('timestamp', 0.0)))
         x, y, z, yaw = self._tm_pose_xy_yaw(data)
@@ -1030,6 +1094,7 @@ class RepDetr3D(MVXTwoStageDetector):
         if current_gt_boxes is None:
             current_gt_boxes = self._tm_tensor(meta.get('gt_bboxes_3d', None))
         features['_state'] = dict(
+            sample_token=None if sample_token is None else str(sample_token),
             scene_token=scene_token,
             timestamp=timestamp,
             ego_x_m=x,
