@@ -183,6 +183,19 @@ def scene_bootstrap_summary(frame: pd.DataFrame, drift_column: str, outcome_colu
     return summary, correlation
 
 
+def build_panel_summary(frame: pd.DataFrame, repetitions: int, seed: int):
+    """Return quintile and correlation summaries for all four paper panels."""
+    quantiles, correlations = [], []
+    for offset, drift_column in (('dt1', 'drift_dt1'), ('dt2', 'drift_dt2')):
+        for outcome in ('prediction_loss', 'box_loss'):
+            summary, correlation = scene_bootstrap_summary(
+                frame, drift_column, outcome, repetitions, seed)
+            quantiles.append(summary.assign(offset=offset, outcome=outcome))
+            correlations.append({'offset': offset, 'outcome': outcome, **correlation})
+    return (pd.concat(quantiles, ignore_index=True),
+            pd.DataFrame(correlations))
+
+
 def validate_collection_manifest(manifest) -> Dict[str, Path]:
     """Validate Task 2 provenance and return its existing artifact paths."""
     required = {'representation_source', 'prediction_mode', 'keyframe_interval',

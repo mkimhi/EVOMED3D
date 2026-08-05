@@ -9,6 +9,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import tools.l24_drift_reuse_risk as reuse_risk
+
 from tools.l24_drift_reuse_risk import (
     frame_error,
     full_feature_cosine,
@@ -82,6 +84,21 @@ def test_scene_bootstrap_returns_five_quantiles_and_perfect_rho():
         frame, 'drift_dt1', 'prediction_loss', 20, 7)
     assert len(summary) == 5
     assert correlation['spearman'] == pytest.approx(1.0)
+
+
+def test_build_panel_summary_has_every_offset_outcome_pair():
+    frame = pd.DataFrame({
+        'scene_token': np.repeat(['a', 'b'], 10),
+        'drift_dt1': np.arange(20.),
+        'drift_dt2': np.arange(20.) + 1,
+        'prediction_loss': np.arange(20.),
+        'box_loss': np.arange(20.)[::-1],
+    })
+    _, correlations = reuse_risk.build_panel_summary(frame, repetitions=20, seed=4)
+    assert set(zip(correlations.offset, correlations.outcome)) == {
+        ('dt1', 'prediction_loss'), ('dt2', 'prediction_loss'),
+        ('dt1', 'box_loss'), ('dt2', 'box_loss'),
+    }
 
 
 def test_validate_collection_manifest_resolves_required_artifact_paths(tmp_path):
