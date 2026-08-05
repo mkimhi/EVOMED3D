@@ -127,10 +127,14 @@ def validate_observed_action(requested, observed, had_memory):
     raise RuntimeError(f'requested {requested}, observed {observed}')
 
 
-def validate_profile_model(model):
+def validate_profile_model(model, requested_action=None):
     controller = getattr(model, 'temporal_memory_controller', None)
-    if controller is None or getattr(model, 'pts_bbox_head', None) is None:
-        raise ValueError('profiler requires an enabled temporal-memory model')
+    if getattr(model, 'pts_bbox_head', None) is None:
+        raise ValueError('profiler requires a detector head')
+    if controller is None:
+        if requested_action is not None:
+            raise ValueError('cannot force an action on a dense model')
+        return
     if (
         controller.updater_name != 'reuse'
         and getattr(model, 'temporal_memory_projector', None) is None
@@ -200,7 +204,7 @@ def main(argv=None):
     checkpoint = load_checkpoint(model, str(checkpoint_path), map_location='cpu')
     model.CLASSES = checkpoint.get('meta', {}).get('CLASSES', dataset.CLASSES)
     model.to(args.device).eval()
-    validate_profile_model(model)
+    validate_profile_model(model, requested_action=args.forced_action)
 
     device_index = int(args.device.split(':', 1)[1]) if ':' in args.device else 0
     frames_path = output_dir / 'frames.jsonl'
@@ -216,16 +220,18 @@ def main(argv=None):
             image = image_list[0]
             shape = validate_input_shape(image.shape)
             wrapper = DetectorTraceWrapper(model, model_kwargs)
-            controller = model.temporal_memory_controller
-            had_memory = controller.memory is not None
+            controller = getattr(model, 'temporal_memory_controller', None)
+            had_memory = controller is not None and controller.memory is not None
             context = (
                 forced_action(controller, args.forced_action)
                 if args.forced_action else nullcontext()
             )
             with context:
                 analysis = analyze_module(wrapper, (image,), shape)
-            observed_action = reported_action(controller)
-            action_forced = bool(controller.last_action_forced)
+            observed_action = (
+                reported_action(controller) if controller is not None else 'L24')
+            action_forced = bool(
+                controller is not None and controller.last_action_forced)
             validate_observed_action(
                 args.forced_action, observed_action, had_memory)
             info = dataset.data_infos[index]

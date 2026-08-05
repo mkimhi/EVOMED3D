@@ -132,3 +132,20 @@ def test_reuse_non_keyframe_has_canonical_action_name():
     assert reported_action(controller) == 'reuse'
     controller.last_action = 'L24'
     assert reported_action(controller) == 'L24'
+
+
+def test_dense_model_is_valid_without_temporal_controller():
+    model = SimpleNamespace(
+        temporal_memory_controller=None,
+        pts_bbox_head=object(),
+    )
+    validate_profile_model(model)
+
+
+def test_dense_model_cannot_force_partial_action():
+    model = SimpleNamespace(
+        temporal_memory_controller=None,
+        pts_bbox_head=object(),
+    )
+    with pytest.raises(ValueError, match='cannot force an action'):
+        validate_profile_model(model, requested_action='L8')
