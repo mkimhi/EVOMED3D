@@ -7,7 +7,13 @@ from torch import nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tools.profile_gflops import analyze_module, parse_args
+from tools.profile_gflops import (
+    analyze_module,
+    append_jsonl,
+    DetectorTraceWrapper,
+    frame_record,
+    parse_args,
+)
 
 
 def test_linear_trace():
@@ -26,3 +32,63 @@ def test_cli_defaults(tmp_path):
         'config.py', 'model.pth', '--output-dir', str(tmp_path)])
     assert (args.device, args.num_samples, args.forced_action) == (
         'cuda:0', 1, None)
+
+
+def test_frame_record_preserves_provenance():
+    analysis = {
+        'macs': 10,
+        'gflops': 2e-8,
+        'image_shape': [1, 6, 3, 320, 800],
+        'unsupported_ops': {},
+        'by_operator_macs': {'linear': 10},
+    }
+    row = frame_record(
+        index=2,
+        token='sample',
+        scene_token='scene',
+        requested_action='L12',
+        observed_action='L12',
+        forced=True,
+        analysis=analysis,
+    )
+    assert row == {
+        **analysis,
+        'index': 2,
+        'sample_token': 'sample',
+        'scene_token': 'scene',
+        'requested_action': 'L12',
+        'action': 'L12',
+        'forced': True,
+    }
+
+
+def test_append_jsonl_writes_one_record(tmp_path):
+    import json
+
+    path = tmp_path / 'frames.jsonl'
+    append_jsonl(path, {'action': 'L24', 'macs': 5})
+    assert json.loads(path.read_text()) == {'action': 'L24', 'macs': 5}
+
+
+def test_detector_trace_wrapper_reconstructs_image_list():
+    class Boxes:
+        tensor = torch.ones(1, 9)
+
+    class Detector(nn.Module):
+        def forward(self, return_loss, rescale, img, marker):
+            assert return_loss is False
+            assert rescale is True
+            assert isinstance(img, list) and len(img) == 1
+            assert marker == 'kept'
+            return [{
+                'pts_bbox': {
+                    'boxes_3d': Boxes(),
+                    'scores_3d': img[0].mean().reshape(1),
+                },
+            }]
+
+    image = torch.ones(1, 6, 3, 320, 800)
+    boxes, scores = DetectorTraceWrapper(
+        Detector(), {'marker': 'kept'})(image)
+    assert boxes.shape == (1, 9)
+    assert scores.tolist() == [1.0]
