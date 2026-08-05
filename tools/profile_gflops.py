@@ -119,6 +119,32 @@ def append_jsonl(path, record):
         stream.write('\n')
 
 
+def validate_observed_action(requested, observed, had_memory):
+    if requested is None or observed == requested:
+        return
+    if observed == 'L24' and not had_memory:
+        return
+    raise RuntimeError(f'requested {requested}, observed {observed}')
+
+
+def validate_profile_model(model):
+    controller = getattr(model, 'temporal_memory_controller', None)
+    if controller is None or getattr(model, 'pts_bbox_head', None) is None:
+        raise ValueError('profiler requires an enabled temporal-memory model')
+    if (
+        controller.updater_name != 'reuse'
+        and getattr(model, 'temporal_memory_projector', None) is None
+    ):
+        raise ValueError('partial-update profiler requires a projector')
+
+
+def reported_action(controller):
+    action = controller.last_action or 'L24'
+    if controller.updater_name == 'reuse' and action != 'L24':
+        return 'reuse'
+    return action
+
+
 def main(argv=None):
     args = parse_args(argv)
     if args.num_samples < 1:
@@ -148,7 +174,6 @@ def main(argv=None):
         file_sha256,
         forced_action,
         select_dataset_cfg,
-        validate_model,
     )
     from tools.eval_utils import limit_dataset
 
@@ -175,7 +200,7 @@ def main(argv=None):
     checkpoint = load_checkpoint(model, str(checkpoint_path), map_location='cpu')
     model.CLASSES = checkpoint.get('meta', {}).get('CLASSES', dataset.CLASSES)
     model.to(args.device).eval()
-    validate_model(model)
+    validate_profile_model(model)
 
     device_index = int(args.device.split(':', 1)[1]) if ':' in args.device else 0
     frames_path = output_dir / 'frames.jsonl'
@@ -192,21 +217,17 @@ def main(argv=None):
             shape = validate_input_shape(image.shape)
             wrapper = DetectorTraceWrapper(model, model_kwargs)
             controller = model.temporal_memory_controller
+            had_memory = controller.memory is not None
             context = (
                 forced_action(controller, args.forced_action)
                 if args.forced_action else nullcontext()
             )
             with context:
                 analysis = analyze_module(wrapper, (image,), shape)
-            observed_action = controller.last_action or 'L24'
+            observed_action = reported_action(controller)
             action_forced = bool(controller.last_action_forced)
-            if (
-                args.forced_action
-                and observed_action != args.forced_action
-                and not (observed_action == 'L24' and action_forced)
-            ):
-                raise RuntimeError(
-                    f'requested {args.forced_action}, observed {observed_action}')
+            validate_observed_action(
+                args.forced_action, observed_action, had_memory)
             info = dataset.data_infos[index]
             row = frame_record(
                 index=index,

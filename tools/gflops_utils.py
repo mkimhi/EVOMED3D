@@ -23,6 +23,7 @@ IGNORED_UNSUPPORTED_OPS = {
     'aten::mul_',
     'aten::nan_to_num',
     'aten::neg',
+    'aten::new_ones',
     'aten::ones_like',
     'aten::pad',
     'aten::pow',

@@ -72,6 +72,7 @@ def test_non_mac_tensor_ops_are_accepted():
         'aten::gelu': 1,
         'aten::mean': 1,
         'aten::mul': 1,
+        'aten::new_ones': 1,
         'aten::softmax': 1,
         'aten::upsample_bicubic2d': 1,
     }

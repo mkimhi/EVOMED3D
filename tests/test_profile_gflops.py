@@ -1,6 +1,7 @@
 import sys
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -14,6 +15,9 @@ from tools.profile_gflops import (
     DetectorTraceWrapper,
     frame_record,
     parse_args,
+    reported_action,
+    validate_profile_model,
+    validate_observed_action,
 )
 
 
@@ -103,3 +107,28 @@ def test_detector_trace_wrapper_reconstructs_image_list():
         Detector(), {'marker': 'kept'})(image)
     assert boxes.shape == (1, 9)
     assert scores.tolist() == [1.0]
+
+
+def test_partial_action_allows_initial_l24_refresh():
+    validate_observed_action('L8', 'L24', had_memory=False)
+
+
+def test_partial_action_rejects_l24_when_memory_existed():
+    with pytest.raises(RuntimeError, match='requested L8, observed L24'):
+        validate_observed_action('L8', 'L24', had_memory=True)
+
+
+def test_reuse_model_does_not_require_projector():
+    model = SimpleNamespace(
+        temporal_memory_controller=SimpleNamespace(updater_name='reuse'),
+        pts_bbox_head=object(),
+        temporal_memory_projector=None,
+    )
+    validate_profile_model(model)
+
+
+def test_reuse_non_keyframe_has_canonical_action_name():
+    controller = SimpleNamespace(updater_name='reuse', last_action='middle')
+    assert reported_action(controller) == 'reuse'
+    controller.last_action = 'L24'
+    assert reported_action(controller) == 'L24'
