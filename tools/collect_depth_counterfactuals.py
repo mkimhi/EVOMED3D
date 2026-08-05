@@ -140,7 +140,21 @@ def prepare_test_dataset_cfg(data_cfg):
     for dataset_cfg in configs:
         dataset_cfg['test_mode'] = True
         dataset_cfg.pop('samples_per_gpu', None)
+        if isinstance(dataset_cfg.get('dataset'), dict):
+            dataset_cfg['dataset'] = prepare_test_dataset_cfg(
+                dataset_cfg['dataset'])
+        if isinstance(dataset_cfg.get('datasets'), (list, tuple)):
+            dataset_cfg['datasets'] = [
+                prepare_test_dataset_cfg(item)
+                for item in dataset_cfg['datasets']
+            ]
     return data_cfg
+
+
+def select_dataset_cfg(cfg, split):
+    data = cfg.data
+    selected = data[split] if isinstance(data, dict) else getattr(data, split)
+    return prepare_test_dataset_cfg(selected)
 
 
 def _normalized_projector_keys(projector):
@@ -204,6 +218,7 @@ def build_manifest(
     cfg_options,
     config_sha256,
     checkpoint_sha256,
+    data_split='val',
 ):
     return {
         'shared_pre_frame_state': True,
@@ -228,6 +243,7 @@ def build_manifest(
             'model': list(MODEL_FIELDS) + ['_tm_policy_prev*'],
         },
         'cfg_options': dict(cfg_options or {}),
+        'data_split': data_split,
     }
 
 
@@ -241,6 +257,8 @@ def parse_args():
     parser.add_argument('--output-dir', default='outputs/drift_depth_analysis')
     parser.add_argument('--num-samples', type=int, default=None)
     parser.add_argument('--device', default='cuda:0')
+    parser.add_argument(
+        '--data-split', default='val', choices=('train', 'val', 'test'))
     parser.add_argument('--cfg-options', nargs='+', action=DictAction)
     return parser.parse_args()
 
@@ -320,7 +338,7 @@ def main():
     _import_config_plugin(cfg, config_path)
     cfg.model.pretrained = None
     cfg.model.train_cfg = None
-    data_cfg = prepare_test_dataset_cfg(cfg.data.test)
+    data_cfg = select_dataset_cfg(cfg, args.data_split)
     dataset = build_dataset(data_cfg)
     if args.num_samples is not None:
         dataset = limit_dataset(dataset, args.num_samples)
@@ -383,6 +401,7 @@ def main():
         cfg_options=args.cfg_options,
         config_sha256=file_sha256(config_path),
         checkpoint_sha256=file_sha256(checkpoint_path),
+        data_split=args.data_split,
     )
     (output_dir / 'counterfactual_manifest.json').write_text(
         json.dumps(manifest, indent=2, sort_keys=True))

@@ -159,3 +159,17 @@ def test_prepare_test_dataset_cfg_removes_dataloader_only_keys():
 
     assert prepared == {'type': 'Dataset', 'test_mode': True}
     assert original['samples_per_gpu'] == 2
+
+
+def test_select_dataset_cfg_uses_requested_split():
+    cfg = SimpleNamespace(data=SimpleNamespace(
+        train={'type': 'Dataset', 'ann_file': 'train.pkl', 'samples_per_gpu': 2},
+        val={'type': 'Dataset', 'ann_file': 'val.pkl'},
+        test={'type': 'Dataset', 'ann_file': 'test.pkl'},
+    ))
+
+    selected = MODULE.select_dataset_cfg(cfg, 'train')
+
+    assert selected['ann_file'] == 'train.pkl'
+    assert selected['test_mode'] is True
+    assert 'samples_per_gpu' not in selected
