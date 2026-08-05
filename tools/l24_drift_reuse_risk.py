@@ -142,9 +142,9 @@ def zero_free_data_limits(values, padding_fraction: float = 0.05):
     if span == 0.0:
         span = max(abs(minimum) * 0.1, 1e-6)
     lower, upper = minimum - padding_fraction * span, maximum + padding_fraction * span
-    if minimum >= 0.0:
+    if minimum > 0.0:
         lower = max(np.nextafter(0.0, 1.0), minimum * (1.0 - padding_fraction))
-    if maximum <= 0.0:
+    if maximum < 0.0:
         upper = min(np.nextafter(0.0, -1.0), maximum * (1.0 - padding_fraction))
     if not np.isfinite([lower, upper]).all() or lower >= upper:
         raise ValueError('could not construct finite informative axis limits')

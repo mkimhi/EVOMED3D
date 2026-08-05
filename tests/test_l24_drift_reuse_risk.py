@@ -108,6 +108,18 @@ def test_zero_free_data_limits_are_finite_and_do_not_force_zero():
     assert 0.0 < lower < upper
 
 
+def test_zero_free_data_limits_include_observed_zero_values():
+    lower, upper = reuse_risk.zero_free_data_limits([0.0, 1.0])
+    assert lower < 0.0 < upper
+    assert upper > 1.0
+
+
+def test_zero_free_data_limits_render_an_all_zero_axis():
+    lower, upper = reuse_risk.zero_free_data_limits([0.0, 0.0])
+    assert np.isfinite([lower, upper]).all()
+    assert lower < 0.0 < upper
+
+
 def test_scene_bootstrap_returns_five_quantiles_and_perfect_rho():
     frame = pd.DataFrame({'scene_token': np.repeat(['a', 'b', 'c'], 5),
                           'drift_dt1': np.arange(15.), 'prediction_loss': np.arange(15.)})
