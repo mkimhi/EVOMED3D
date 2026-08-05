@@ -1,0 +1,104 @@
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from tools.l24_drift_reuse_risk import (
+    frame_error,
+    full_feature_cosine,
+    scene_bootstrap_summary,
+    select_reuse_targets,
+    validate_collection_manifest,
+)
+
+
+def box(name, xy, score):
+    return {
+        'name': name,
+        'translation': np.array([xy[0], xy[1], 0.0]),
+        'size': np.array([2.0, 4.0, 1.5]),
+        'rotation': np.array([1.0, 0.0, 0.0, 0.0]),
+        'velocity': np.array([0.0, 0.0]),
+        'score': score,
+    }
+
+
+def test_select_reuse_targets_is_scene_balanced_and_skips_keyframes():
+    infos = ([{'token': f'a-{i}', 'scene_token': 'a'} for i in range(50)] +
+             [{'token': f'b-{i}', 'scene_token': 'b'} for i in range(50)])
+    rows = select_reuse_targets(infos, num_scenes=2, targets_per_scene=20)
+    assert len(rows) == 40
+    assert {row['scene_token'] for row in rows} == {'a', 'b'}
+    assert all(row['frame_index'] >= 2 and row['frame_index'] % 2 == 1 for row in rows)
+
+
+def test_select_reuse_targets_rejects_duplicate_tokens_and_noncontiguous_scenes():
+    duplicate = [{'token': 'same', 'scene_token': 'a'}] * 5
+    with pytest.raises(ValueError, match='duplicate token'):
+        select_reuse_targets(duplicate, num_scenes=1, targets_per_scene=1)
+
+    repeated = [{'token': 'a-0', 'scene_token': 'a'}, {'token': 'b-0', 'scene_token': 'b'},
+                {'token': 'a-1', 'scene_token': 'a'}]
+    with pytest.raises(ValueError, match='non-contiguous'):
+        select_reuse_targets(repeated, num_scenes=1, targets_per_scene=1)
+
+
+def test_full_feature_cosine_handles_identity_and_orthogonal_inputs():
+    x = [torch.tensor([[[[[1.0]], [[0.0]]]]])]
+    y = [torch.tensor([[[[[0.0]], [[1.0]]]]])]
+    assert full_feature_cosine(x, x) == pytest.approx(1.0)
+    assert full_feature_cosine(x, y) == pytest.approx(0.0)
+
+
+def test_frame_error_excludes_confidence_for_box_loss():
+    target = box('car', (0, 0), score=1.0)
+    prediction = box('car', (0, 0), score=0.25)
+    assert frame_error([], [target], True) == pytest.approx(1.0)
+    assert frame_error([prediction], [target], True) > 0.0
+    assert frame_error([prediction], [target], False) == pytest.approx(0.0)
+
+
+def test_scene_bootstrap_returns_five_quantiles_and_perfect_rho():
+    frame = pd.DataFrame({'scene_token': np.repeat(['a', 'b', 'c'], 5),
+                          'drift_dt1': np.arange(15.), 'prediction_loss': np.arange(15.)})
+    summary, correlation = scene_bootstrap_summary(
+        frame, 'drift_dt1', 'prediction_loss', 20, 7)
+    assert len(summary) == 5
+    assert correlation['spearman'] == pytest.approx(1.0)
+
+
+def test_validate_collection_manifest_resolves_required_artifact_paths(tmp_path):
+    paths = {name: tmp_path / f'{name}.csv' for name in ('selection', 'drift')}
+    paths['predictions'] = tmp_path / 'results_nusc.json'
+    for path in paths.values():
+        path.write_text('{}')
+    manifest = {
+        'representation_source': 'base_full_l24_backbone_neck',
+        'prediction_mode': 'naive_reuse_k2',
+        'keyframe_interval': 2,
+        'selection_path': str(paths['selection']),
+        'drift_path': str(paths['drift']),
+        'prediction_path': str(paths['predictions']),
+    }
+    assert validate_collection_manifest(manifest) == {
+        'selection': paths['selection'], 'drift': paths['drift'],
+        'predictions': paths['predictions'],
+    }
+
+
+def test_validate_collection_manifest_rejects_wrong_provenance(tmp_path):
+    manifest = {
+        'representation_source': 'partial_l8',
+        'prediction_mode': 'naive_reuse_k2',
+        'keyframe_interval': 2,
+        'selection_path': str(tmp_path / 'selection.csv'),
+        'drift_path': str(tmp_path / 'drift.csv'),
+        'prediction_path': str(tmp_path / 'results_nusc.json'),
+    }
+    with pytest.raises(ValueError, match='base full L24'):
+        validate_collection_manifest(manifest)
