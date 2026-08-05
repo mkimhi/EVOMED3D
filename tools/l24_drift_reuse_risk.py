@@ -17,6 +17,8 @@ VELOCITY_SCALE_MPS = 10.0
 WEIGHTS = {'confidence': 0.5, 'center': 0.2, 'size': 0.1, 'yaw': 0.1, 'velocity': 0.1}
 UNMATCHED_PENALTY = 1.0
 _INVALID_MATCH_COST = 1e6
+PREDICTION_SCORE_FLOOR = 0.10
+FULL_FEATURE_COSINE_AGGREGATION = 'mean_of_level_mean_channelwise_cosine'
 
 
 @dataclass(frozen=True)
@@ -75,16 +77,78 @@ def select_reuse_targets(data_infos, num_scenes=100, targets_per_scene=20,
             for row in group.evenly_spaced_reuse_rows(targets_per_scene, keyframe_interval)]
 
 
-def full_feature_cosine(previous: Sequence[torch.Tensor], current: Sequence[torch.Tensor]) -> float:
-    """Mean channel-wise cosine similarity across full L24 feature tensors."""
+def full_feature_cosine_statistics(previous: Sequence[torch.Tensor], current: Sequence[torch.Tensor]):
+    """Return compact per-level sufficient statistics for the L24 cosine metric."""
     if not previous or not current or len(previous) != len(current):
         raise ValueError('previous and current must be non-empty lists of equal length')
-    values = []
-    for before, after in zip(previous, current):
+    levels = []
+    for level_index, (before, after) in enumerate(zip(previous, current)):
         if before.shape != after.shape or before.ndim <= 2:
             raise ValueError('feature tensors must have matching shapes with channel dimension 2')
-        values.append(F.cosine_similarity(before.float(), after.float(), dim=2).mean())
-    return float(torch.stack(values).mean().detach().cpu())
+        cosine = F.cosine_similarity(before.float(), after.float(), dim=2)
+        levels.append({
+            'level_index': level_index,
+            'cosine_sum': float(cosine.sum().detach().cpu()),
+            'vector_count': int(cosine.numel()),
+        })
+    return {'aggregation': FULL_FEATURE_COSINE_AGGREGATION, 'levels': levels}
+
+
+def reconstruct_full_feature_cosine(statistics) -> float:
+    """Reconstruct ``full_feature_cosine`` exactly from per-level summaries."""
+    if not isinstance(statistics, dict) or statistics.get('aggregation') != FULL_FEATURE_COSINE_AGGREGATION:
+        raise ValueError('invalid full-L24 cosine aggregation metadata')
+    levels = statistics.get('levels')
+    if not isinstance(levels, list) or not levels:
+        raise ValueError('full-L24 cosine statistics require non-empty levels')
+    means = []
+    for level in levels:
+        count = level.get('vector_count', 0)
+        if not isinstance(count, int) or count < 1:
+            raise ValueError('full-L24 cosine level has invalid vector_count')
+        means.append(float(level['cosine_sum']) / count)
+    return float(np.mean(means))
+
+
+def full_feature_cosine(previous: Sequence[torch.Tensor], current: Sequence[torch.Tensor]) -> float:
+    """Mean channel-wise cosine similarity across full L24 feature tensors."""
+    return reconstruct_full_feature_cosine(full_feature_cosine_statistics(previous, current))
+
+
+def filter_predictions_by_score(predictions, score_floor: float = PREDICTION_SCORE_FLOOR):
+    """Keep only predictions meeting the pre-specified detection-score floor."""
+    if not np.isfinite(score_floor) or score_floor < 0.0:
+        raise ValueError('score_floor must be a finite non-negative value')
+    filtered = []
+    for prediction in predictions:
+        score = prediction.get('detection_score', prediction.get('score'))
+        if score is None:
+            raise ValueError('prediction is missing detection_score/score')
+        if float(score) >= score_floor:
+            filtered.append(prediction)
+    return filtered
+
+
+def zero_free_data_limits(values, padding_fraction: float = 0.05):
+    """Return finite padded limits without imposing a zero baseline."""
+    values = np.asarray(values, dtype=float).reshape(-1)
+    values = values[np.isfinite(values)]
+    if not len(values):
+        raise ValueError('axis limits require at least one finite value')
+    if not 0.0 <= padding_fraction < 1.0:
+        raise ValueError('padding_fraction must be in [0, 1)')
+    minimum, maximum = float(values.min()), float(values.max())
+    span = maximum - minimum
+    if span == 0.0:
+        span = max(abs(minimum) * 0.1, 1e-6)
+    lower, upper = minimum - padding_fraction * span, maximum + padding_fraction * span
+    if minimum >= 0.0:
+        lower = max(np.nextafter(0.0, 1.0), minimum * (1.0 - padding_fraction))
+    if maximum <= 0.0:
+        upper = min(np.nextafter(0.0, -1.0), maximum * (1.0 - padding_fraction))
+    if not np.isfinite([lower, upper]).all() or lower >= upper:
+        raise ValueError('could not construct finite informative axis limits')
+    return float(lower), float(upper)
 
 
 def _yaw(rotation):
@@ -243,18 +307,39 @@ def validate_target_tables(selection: pd.DataFrame, drift: pd.DataFrame, predict
 
 def validate_collection_manifest(manifest) -> Dict[str, Path]:
     """Validate Task 2 provenance and return its existing artifact paths."""
+    if manifest.get('representation_source') != 'base_full_l24_backbone_neck':
+        raise ValueError('manifest must use base full L24 backbone/neck features')
+    if manifest.get('prediction_mode') != 'naive_reuse_k2' or manifest.get('keyframe_interval') != 2:
+        raise ValueError('manifest must describe naive reuse K=2 predictions')
     required = {'representation_source', 'prediction_mode', 'keyframe_interval',
-                'selection_path', 'drift_path', 'prediction_path'}
+                'selection_path', 'drift_path', 'drift_statistics_path', 'prediction_path',
+                'dataset_version', 'selected_scene_tokens', 'selected_target_tokens',
+                'selection_sha256', 'qualified_scene_count', 'selected_target_count'}
     missing = required - set(manifest)
     if missing:
         raise ValueError('manifest missing keys: {}'.format(sorted(missing)))
-    if manifest['representation_source'] != 'base_full_l24_backbone_neck':
-        raise ValueError('manifest must use base full L24 backbone/neck features')
-    if manifest['prediction_mode'] != 'naive_reuse_k2' or manifest['keyframe_interval'] != 2:
-        raise ValueError('manifest must describe naive reuse K=2 predictions')
     paths = {'selection': Path(manifest['selection_path']), 'drift': Path(manifest['drift_path']),
+             'drift_statistics': Path(manifest['drift_statistics_path']),
              'predictions': Path(manifest['prediction_path'])}
     missing_paths = [str(path) for path in paths.values() if not path.is_file()]
     if missing_paths:
         raise FileNotFoundError('manifest artifact paths do not exist: {}'.format(missing_paths))
+    if not isinstance(manifest['dataset_version'], str) or not manifest['dataset_version']:
+        raise ValueError('manifest must record a non-empty nuScenes dataset_version')
+    scenes, tokens = manifest['selected_scene_tokens'], manifest['selected_target_tokens']
+    if not isinstance(scenes, list) or not scenes or not isinstance(tokens, list) or not tokens:
+        raise ValueError('manifest must record selected scene and target token lists')
+    if len(scenes) != manifest['qualified_scene_count'] or len(tokens) != manifest['selected_target_count']:
+        raise ValueError('manifest selected token counts do not match recorded counts')
+    selection_bytes = paths['selection'].read_bytes()
+    import hashlib
+    if hashlib.sha256(selection_bytes).hexdigest() != manifest['selection_sha256']:
+        raise ValueError('selection.csv digest does not match manifest provenance')
+    selection = pd.read_csv(paths['selection'])
+    if {'token', 'scene_token'} - set(selection.columns):
+        raise ValueError('selection.csv lacks token/scene_token provenance columns')
+    if selection['token'].tolist() != tokens:
+        raise ValueError('selection.csv selected target tokens do not match manifest')
+    if list(dict.fromkeys(selection['scene_token'])) != scenes:
+        raise ValueError('selection.csv selected scene tokens do not match manifest')
     return paths

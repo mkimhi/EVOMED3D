@@ -1,6 +1,6 @@
 # L24 drift versus naive-reuse K=2 risk analysis
 
-This analysis uses the full final L24 backbone/neck representation and the deployed RepDETR3D EVA-02 naive-reuse K=2 detector. It selects exactly 20 non-keyframe targets in each of 100 validation scenes (2,000 targets), measures delta-t=1 and delta-t=2 cosine drift, and relates each to absolute GT prediction and box error.
+This analysis uses the full final L24 backbone/neck representation and the deployed RepDETR3D EVA-02 naive-reuse K=2 detector. It selects exactly 20 non-keyframe targets in each of 100 validation scenes (2,000 targets), measures delta-t=1 and delta-t=2 cosine drift, and relates each to absolute GT prediction and box error. Before both endpoints, predictions use the pre-specified `0.10` detection-score floor.
 
 ## Collect the fixed study
 
@@ -34,11 +34,12 @@ jupyter nbconvert --to notebook --execute \
   --output outputs/l24_drift_reuse_risk/executed_notebook.ipynb
 ```
 
-The production notebook has no synthetic fallback. It fails clearly if `collection_manifest.json` or any referenced collector artifact is absent, has the wrong base-L24/K=2 provenance, or does not cover exactly 2,000 unique targets from 100 scenes. It validates all collector artifacts before loading nuScenes GT.
+The production notebook has no synthetic fallback. It fails clearly if `collection_manifest.json` or any referenced collector artifact is absent, has the wrong base-L24/K=2 provenance, or does not cover exactly 2,000 unique targets from 100 scenes. Before loading nuScenes GT, it verifies the collector's dataset version, selection-file digest, ordered target/scene identities, target-to-scene mapping, and artifact coverage. The analysis derives the nuScenes version from that provenance; an explicit version environment override must match it.
 
 Expected output files under `outputs/l24_drift_reuse_risk/` are:
 
 - `per_frame_gt_loss.csv`
+- `full_l24_drift_statistics.json`
 - `quantile_summary.csv`
 - `correlation_summary.csv`
 - `analysis_config.json`
@@ -46,7 +47,9 @@ Expected output files under `outputs/l24_drift_reuse_risk/` are:
 - `fig_l24_drift_vs_naive_reuse_gt_loss.pdf`
 - `fig_l24_drift_vs_naive_reuse_gt_loss.png`
 
-The production notebook also copies the PDF and 300-dpi PNG figure to `paper/figures/` using the same basename. The figure is a 2-by-2 panel: prediction/box loss by delta-t=1/delta-t=2, with density-aware rasterized scatter, isotonic trend, quintile means with scene-bootstrap 95% CIs, and bootstrap Spearman intervals (2,000 complete-scene resamples).
+`full_l24_drift_statistics.json` stores the per-level cosine sums and vector counts for every target and both history offsets. Its declared aggregation reconstructs the reported drift without retaining full feature tensors.
+
+The production notebook also copies the PDF and 300-dpi PNG figure to `paper/figures/` using the same basename. The figure is a 2-by-2 panel: prediction/box loss by delta-t=1/delta-t=2, with density-aware rasterized scatter, isotonic trend, quintile means with scene-bootstrap 95% CIs, and bootstrap Spearman intervals (2,000 complete-scene resamples). Each positive-valued axis uses finite data-driven 5% padding and does not force a zero baseline; the resolved ranges are recorded in `validation_summary.json`.
 
 ## Synthetic notebook smoke check
 

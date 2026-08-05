@@ -21,7 +21,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tools.l24_drift_reuse_risk import full_feature_cosine, select_reuse_targets
+from tools.l24_drift_reuse_risk import (
+    FULL_FEATURE_COSINE_AGGREGATION,
+    full_feature_cosine_statistics,
+    reconstruct_full_feature_cosine,
+    select_reuse_targets,
+)
 
 
 EXPECTED_SCENE_COUNT = 100
@@ -72,11 +77,15 @@ def record_target_drift(token, scene_token, history_by_scene, current_features=N
         raise ValueError('target requires two full-L24 history frames in the same scene')
     if current_features is None:
         raise ValueError('target drift requires current full-L24 features')
+    dt1_statistics = full_feature_cosine_statistics(history[-1], current_features)
+    dt2_statistics = full_feature_cosine_statistics(history[-2], current_features)
     return {
         'token': token,
         'scene_token': scene_token,
-        'drift_dt1': 1.0 - full_feature_cosine(history[-1], current_features),
-        'drift_dt2': 1.0 - full_feature_cosine(history[-2], current_features),
+        'drift_dt1': 1.0 - reconstruct_full_feature_cosine(dt1_statistics),
+        'drift_dt2': 1.0 - reconstruct_full_feature_cosine(dt2_statistics),
+        'dt1_statistics': dt1_statistics,
+        'dt2_statistics': dt2_statistics,
     }
 
 
@@ -92,6 +101,10 @@ def build_collection_manifest(
     seed,
     scene_count,
     target_count,
+    drift_statistics_path=None,
+    dataset_version=None,
+    selected_scene_tokens=None,
+    selected_target_tokens=None,
     cfg_options=None,
     resolved_temporal_memory=None,
 ):
@@ -109,9 +122,14 @@ def build_collection_manifest(
         'seed': int(seed),
         'selection_path': str(Path(selection_path).resolve()),
         'drift_path': str(Path(drift_path).resolve()),
+        'drift_statistics_path': str(Path(drift_statistics_path).resolve()) if drift_statistics_path else None,
         'prediction_path': str(Path(prediction_path).resolve()),
         'qualified_scene_count': int(scene_count),
         'selected_target_count': int(target_count),
+        'dataset_version': dataset_version,
+        'selected_scene_tokens': list(selected_scene_tokens or ()),
+        'selected_target_tokens': list(selected_target_tokens or ()),
+        'selection_sha256': file_sha256(selection_path),
         'cfg_options': dict(cfg_options or {}),
         'resolved_temporal_memory': dict(resolved_temporal_memory or {}),
     }
@@ -328,6 +346,9 @@ def main():
     cfg.model.pretrained = None
     cfg.model.train_cfg = None
     dataset = build_dataset(prepare_test_dataset_cfg(cfg.data.test))
+    dataset_version = getattr(dataset, 'version', None)
+    if not isinstance(dataset_version, str) or not dataset_version:
+        raise ValueError('collector requires dataset.version for GT provenance')
     targets = select_reuse_targets(
         dataset.data_infos,
         num_scenes=args.num_scenes,
@@ -338,13 +359,13 @@ def main():
     selected_tokens = [row['token'] for row in targets]
     if len(selected_tokens) != len(set(selected_tokens)):
         raise ValueError('selection contains duplicate target tokens')
-    selected_scene_tokens = {row['scene_token'] for row in targets}
+    selected_scene_tokens = list(dict.fromkeys(row['scene_token'] for row in targets))
     if len(selected_scene_tokens) != EXPECTED_SCENE_COUNT:
         raise ValueError('selection did not produce exactly {} scenes'.format(EXPECTED_SCENE_COUNT))
     selection_path = output_dir / 'selection.csv'
     _write_csv(targets, selection_path, ('token', 'scene_token', 'frame_index'))
 
-    collection_infos = _restrict_dataset_to_selected_scenes(dataset, selected_scene_tokens)
+    collection_infos = _restrict_dataset_to_selected_scenes(dataset, set(selected_scene_tokens))
     data_loader = build_dataloader(
         dataset,
         samples_per_gpu=1,
@@ -368,6 +389,7 @@ def main():
     target_tokens = set(selected_tokens)
     target_predictions_by_token = {}
     drift_rows = []
+    drift_statistics_records = []
     history_by_scene = {}
     active_scene = None
     with torch.no_grad():
@@ -391,8 +413,16 @@ def main():
             result = parallel_model(return_loss=False, rescale=True, **data)
             if token in target_tokens:
                 _assert_reuse_action(model)
-                drift_rows.append(record_target_drift(
-                    token, scene_token, history_by_scene, full_features))
+                drift_record = record_target_drift(
+                    token, scene_token, history_by_scene, full_features)
+                drift_rows.append({key: drift_record[key] for key in (
+                    'token', 'scene_token', 'drift_dt1', 'drift_dt2')})
+                drift_statistics_records.append({
+                    'token': token,
+                    'scene_token': scene_token,
+                    'dt1': drift_record['dt1_statistics'],
+                    'dt2': drift_record['dt2_statistics'],
+                })
                 if token in target_predictions_by_token:
                     raise ValueError('collector observed a duplicate target prediction token')
                 target_predictions_by_token[token] = _prediction_items(result)
@@ -409,6 +439,11 @@ def main():
         raise ValueError('drift rows do not exactly match selected target tokens')
     drift_path = output_dir / 'full_l24_drift.csv'
     _write_csv(drift_rows, drift_path, ('token', 'scene_token', 'drift_dt1', 'drift_dt2'))
+    drift_statistics_path = output_dir / 'full_l24_drift_statistics.json'
+    drift_statistics_path.write_text(json.dumps({
+        'aggregation': FULL_FEATURE_COSINE_AGGREGATION,
+        'records': drift_statistics_records,
+    }, indent=2, sort_keys=True))
     target_info_by_token = {info['token']: info for info in collection_infos}
     target_infos = [target_info_by_token[token] for token in selected_tokens]
     prediction_path = _format_target_predictions(
@@ -420,6 +455,10 @@ def main():
         run_id, config_path, checkpoint_path, selection_path, drift_path,
         prediction_path, file_sha256(config_path), file_sha256(checkpoint_path),
         args.seed, len(selected_scene_tokens), len(selected_tokens),
+        drift_statistics_path=drift_statistics_path,
+        dataset_version=dataset_version,
+        selected_scene_tokens=selected_scene_tokens,
+        selected_target_tokens=selected_tokens,
         cfg_options=args.cfg_options,
         resolved_temporal_memory=resolved_temporal_memory)
     (output_dir / 'collection_manifest.json').write_text(
@@ -429,6 +468,7 @@ def main():
         'qualified_scene_count': len(selected_scene_tokens),
         'selected_target_count': len(selected_tokens),
         'drift_record_count': len(drift_rows),
+        'drift_statistics_path': str(drift_statistics_path.resolve()),
         'prediction_path': str(prediction_path.resolve()),
     }
     (output_dir / 'collection_summary.json').write_text(

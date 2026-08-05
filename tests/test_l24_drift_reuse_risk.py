@@ -1,4 +1,5 @@
 import sys
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -77,6 +78,36 @@ def test_frame_error_excludes_confidence_for_box_loss():
     assert frame_error([prediction], [target], False) == pytest.approx(0.0)
 
 
+def test_score_floor_excludes_low_confidence_boxes_from_both_endpoints():
+    target = box('car', (0, 0), score=1.0)
+    above_floor = box('car', (0, 0), score=0.50)
+    below_floor = box('car', (20, 20), score=0.09)
+    filtered = reuse_risk.filter_predictions_by_score(
+        [above_floor, below_floor], score_floor=0.10)
+    assert filtered == [above_floor]
+    assert frame_error(filtered, [target], True) == pytest.approx(
+        frame_error([above_floor], [target], True))
+    assert frame_error(filtered, [target], False) == pytest.approx(
+        frame_error([above_floor], [target], False))
+
+
+def test_full_feature_cosine_statistics_reconstruct_both_drift_offsets():
+    current = [torch.tensor([[[[[1.0]], [[0.0]]]]])]
+    previous_dt1 = [torch.tensor([[[[[0.0]], [[1.0]]]]])]
+    previous_dt2 = [torch.tensor([[[[[1.0]], [[0.0]]]]])]
+    dt1_statistics = reuse_risk.full_feature_cosine_statistics(previous_dt1, current)
+    dt2_statistics = reuse_risk.full_feature_cosine_statistics(previous_dt2, current)
+    assert reuse_risk.reconstruct_full_feature_cosine(dt1_statistics) == pytest.approx(0.0)
+    assert reuse_risk.reconstruct_full_feature_cosine(dt2_statistics) == pytest.approx(1.0)
+    assert dt1_statistics['levels'][0]['vector_count'] == 1
+
+
+def test_zero_free_data_limits_are_finite_and_do_not_force_zero():
+    lower, upper = reuse_risk.zero_free_data_limits([0.1, 0.5, 0.9])
+    assert np.isfinite([lower, upper]).all()
+    assert 0.0 < lower < upper
+
+
 def test_scene_bootstrap_returns_five_quantiles_and_perfect_rho():
     frame = pd.DataFrame({'scene_token': np.repeat(['a', 'b', 'c'], 5),
                           'drift_dt1': np.arange(15.), 'prediction_loss': np.arange(15.)})
@@ -126,22 +157,60 @@ def test_validate_target_tables_rejects_token_to_scene_mismatch_before_merge():
 
 
 def test_validate_collection_manifest_resolves_required_artifact_paths(tmp_path):
-    paths = {name: tmp_path / f'{name}.csv' for name in ('selection', 'drift')}
-    paths['predictions'] = tmp_path / 'results_nusc.json'
-    for path in paths.values():
-        path.write_text('{}')
+    paths = {'selection': tmp_path / 'selection.csv', 'drift': tmp_path / 'drift.csv',
+             'drift_statistics': tmp_path / 'drift_statistics.json',
+             'predictions': tmp_path / 'results_nusc.json'}
+    paths['selection'].write_text('token,scene_token,frame_index\na,scene-a,3\n')
+    for name, path in paths.items():
+        if name != 'selection':
+            path.write_text('{}')
     manifest = {
         'representation_source': 'base_full_l24_backbone_neck',
         'prediction_mode': 'naive_reuse_k2',
         'keyframe_interval': 2,
         'selection_path': str(paths['selection']),
         'drift_path': str(paths['drift']),
+        'drift_statistics_path': str(paths['drift_statistics']),
         'prediction_path': str(paths['predictions']),
+        'dataset_version': 'v1.0-trainval',
+        'selected_scene_tokens': ['scene-a'],
+        'selected_target_tokens': ['a'],
+        'selection_sha256': hashlib.sha256(paths['selection'].read_bytes()).hexdigest(),
+        'qualified_scene_count': 1,
+        'selected_target_count': 1,
     }
     assert validate_collection_manifest(manifest) == {
         'selection': paths['selection'], 'drift': paths['drift'],
+        'drift_statistics': paths['drift_statistics'],
         'predictions': paths['predictions'],
     }
+
+
+def test_validate_collection_manifest_rejects_selection_identity_mismatch(tmp_path):
+    selection_path = tmp_path / 'selection.csv'
+    selection_path.write_text('token,scene_token,frame_index\na,scene-a,3\nb,scene-a,5\n')
+    paths = {
+        'drift_path': tmp_path / 'drift.csv',
+        'prediction_path': tmp_path / 'results_nusc.json',
+        'drift_statistics_path': tmp_path / 'drift_statistics.json',
+    }
+    for path in paths.values():
+        path.write_text('{}')
+    manifest = {
+        'representation_source': 'base_full_l24_backbone_neck',
+        'prediction_mode': 'naive_reuse_k2',
+        'keyframe_interval': 2,
+        'selection_path': str(selection_path),
+        **{name: str(path) for name, path in paths.items()},
+        'dataset_version': 'v1.0-trainval',
+        'selected_scene_tokens': ['scene-a'],
+        'selected_target_tokens': ['b', 'a'],
+        'selection_sha256': hashlib.sha256(selection_path.read_bytes()).hexdigest(),
+        'qualified_scene_count': 1,
+        'selected_target_count': 2,
+    }
+    with pytest.raises(ValueError, match='selected target tokens'):
+        validate_collection_manifest(manifest)
 
 
 def test_validate_collection_manifest_rejects_wrong_provenance(tmp_path):
@@ -158,14 +227,22 @@ def test_validate_collection_manifest_rejects_wrong_provenance(tmp_path):
 
 
 def test_manifest_marks_base_l24_and_naive_reuse_k2(tmp_path):
+    selection_path = tmp_path / 'selection.csv'
+    selection_path.write_text('token,scene_token,frame_index\na,scene-a,3\n')
+    drift_statistics_path = tmp_path / 'drift_statistics.json'
+    drift_statistics_path.write_text('{}')
     manifest = build_collection_manifest(
         'run', tmp_path / 'c.py', tmp_path / 'm.pth',
-        tmp_path / 'selection.csv', tmp_path / 'drift.csv',
+        selection_path, tmp_path / 'drift.csv',
         tmp_path / 'results.json', 'config-hash', 'checkpoint-hash',
-        9, 100, 2000)
+        9, 100, 2000, drift_statistics_path=drift_statistics_path,
+        dataset_version='v1.0-trainval', selected_scene_tokens=['scene-a'],
+        selected_target_tokens=['a'])
     assert manifest['representation_source'] == 'base_full_l24_backbone_neck'
     assert manifest['prediction_mode'] == 'naive_reuse_k2'
     assert manifest['keyframe_interval'] == 2
+    assert manifest['dataset_version'] == 'v1.0-trainval'
+    assert manifest['selected_target_tokens'] == ['a']
 
 
 def test_target_drift_rejects_cross_scene_or_short_history():
