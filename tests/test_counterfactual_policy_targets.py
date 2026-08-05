@@ -71,3 +71,69 @@ def test_optional_loss_constraint_can_reject_shallow_action():
         losses=losses,
         max_loss_degradation=0.05,
     ) == 'L12'
+
+
+def detection(score=0.9, x=1.0):
+    return dict(
+        detection_name='car',
+        detection_score=score,
+        translation=[x, 0.0, 0.0],
+        size=[2.0, 4.0, 1.5],
+        rotation=[1.0, 0.0, 0.0, 0.0],
+        velocity=[0.0, 0.0],
+    )
+
+
+def test_previous_prediction_features_follow_canonical_action_and_scene_reset():
+    frames = [
+        {'token': 'a0', 'scene_token': 'A', 'canonical_action': 'L8'},
+        {'token': 'a1', 'scene_token': 'A', 'canonical_action': 'L24'},
+        {'token': 'b0', 'scene_token': 'B', 'canonical_action': 'L12'},
+    ]
+    branches = {
+        action: {token: [] for token in ('a0', 'a1', 'b0')}
+        for action in ('L8', 'L12', 'L16', 'L24')
+    }
+    branches['L8']['a0'] = [detection()]
+
+    rows = MODULE.build_previous_prediction_rows(frames, branches)
+
+    assert rows[0]['num_annotations'] == 0.0
+    assert rows[1]['num_annotations'] == 1.0
+    assert rows[2]['num_annotations'] == 0.0
+
+
+def test_prediction_features_apply_score_threshold():
+    features = MODULE.prediction_features([
+        detection(score=0.09), detection(score=0.8, x=3.0)
+    ])
+    assert features['num_annotations'] == 1.0
+    assert features['avg_object_distance_m'] == pytest.approx(3.0)
+
+
+def test_manifest_requires_shared_pre_frame_state():
+    with pytest.raises(ValueError, match='shared pre-frame state'):
+        MODULE.validate_manifest({'shared_pre_frame_state': False})
+
+
+def test_build_target_rows_records_errors_degradation_and_oracle_action():
+    frames = [
+        {'token': 'a0', 'scene_token': 'A', 'canonical_action': 'L24'},
+    ]
+    branches = {
+        'L8': {'a0': [box('car', x=3.0)]},
+        'L12': {'a0': [box('car', x=1.0)]},
+        'L16': {'a0': [box('car', x=0.5)]},
+        'L24': {'a0': [box('car', x=0.0)]},
+    }
+    rows = MODULE.build_target_rows(
+        frames=frames,
+        branch_results=branches,
+        ground_truth={'a0': [box('car', x=0.0)]},
+        metadata={'a0': {'token': 'a0', 'frame_number': 0.0}},
+        metric_config=MetricConfig(),
+        max_matched_degradation=0.1,
+    )
+    assert rows[0]['oracle_action'] == 'L12'
+    assert rows[0]['error_L24'] == pytest.approx(0.0)
+    assert rows[0]['degradation_L16'] == pytest.approx(rows[0]['error_L16'])
