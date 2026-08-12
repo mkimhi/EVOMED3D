@@ -109,6 +109,23 @@ def test_streampetr_non_keyframe_uses_l12_and_never_calls_teacher_inference():
     assert model.full_calls == 1
 
 
+def test_streampetr_reuse_non_keyframe_never_extracts_partial_features():
+    model = make_fake_petr3d(temporal_memory=dict(
+        enabled=True,
+        keyframe_interval=4,
+        partial_layer="block12",
+        updater="reuse",
+    ))
+
+    model._extract_img_feat_temporal_memory(
+        _frame(1.0), _metas(sample="sample-0"), training=False)
+    features, _ = model._extract_img_feat_temporal_memory(
+        _frame(2.0), _metas(sample="sample-1"), training=False)
+
+    assert model.intermediate_layers == []
+    assert torch.equal(features, _frame(101.0))
+
+
 def test_streampetr_mixed_batch_extracts_only_each_routed_sample_subset():
     model = make_fake_petr3d(temporal_memory=dict(
         enabled=True,
@@ -272,6 +289,165 @@ def test_streampetr_inference_teacher_guard_uses_resolved_controller_config():
     assert losses == {}
 
 
+def test_streampetr_policy_receives_per_sample_features_and_is_registered():
+    from projects.mmdet3d_plugin.models.detectors.petr3d import Petr3D
+    from projects.mmdet3d_plugin.models.temporal_memory import TemporalMemoryController
+
+    class FeaturePolicy(torch.nn.Module):
+        feature_names = ["desired_action"]
+
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(()))
+            self.seen = []
+
+        def decide(self, has_memory, is_reset_frame=False,
+                   policy_features=None, **kwargs):
+            self.seen.append(dict(policy_features or {}))
+            if is_reset_frame or not has_memory:
+                return "L24"
+            return policy_features["desired_action"]
+
+    model = make_fake_petr3d(temporal_memory=dict(
+        enabled=True, updater="partial_only", partial_layer="block12"))
+    policy = FeaturePolicy()
+    model.temporal_memory_controller = TemporalMemoryController(
+        enabled=True, updater="partial_only", policy=policy)
+    model.temporal_memory_policy = policy
+    assert "temporal_memory_policy.weight" in dict(model.named_parameters())
+    metas = [
+        {"scene_token": "scene-a", "desired_action": "L8"},
+        {"scene_token": "scene-b", "desired_action": "L12"},
+    ]
+    img = torch.tensor([1.0, 2.0]).reshape(2, 1, 1, 1, 1)
+    model._extract_img_feat_temporal_memory(img, metas, training=False)
+    model._extract_img_feat_temporal_memory(img, metas, training=False)
+
+    assert policy.seen[-2]["desired_action"] == "L8"
+    assert policy.seen[-1]["desired_action"] == "L12"
+    assert model.intermediate_layers[-2:] == [8, 12]
+
+
+def test_streampetr_teacher_forcing_uses_previous_gt_then_predictions():
+    model = make_fake_petr3d(temporal_memory=dict(enabled=True))
+    model.temporal_memory["policy_offline_features"] = "teacher_forcing"
+    state = model.temporal_memory_controller.states.setdefault(
+        ("scene-a", 0), {})
+    state["offline_gt_features"] = {"num_annotations": 7.0}
+    model._temporal_memory_record_predictions(
+        [{"boxes_3d": torch.tensor([
+            [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 3.0, 4.0],
+            [1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 2.0],
+            [2.0, 2.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0],
+        ])}],
+        [{"scene_token": "scene-a"}],
+    )
+
+    model.train(True)
+    training = model._temporal_memory_policy_features(
+        {"scene_token": "scene-a"}, {}, state, frame_number=1)
+    model.train(False)
+    inference = model._temporal_memory_policy_features(
+        {"scene_token": "scene-a"}, {}, state, frame_number=1)
+
+    assert training["num_annotations"] == 7.0
+    assert inference["num_annotations"] == 3.0
+    assert inference["max_object_speed_mps"] == 5.0
+
+
+def test_streampetr_policy_supervision_returns_trainable_loss():
+    from projects.mmdet3d_plugin.models.temporal_memory import (
+        MlpFramePolicy,
+        TemporalMemoryController,
+    )
+
+    model = make_fake_petr3d(temporal_memory=dict(
+        enabled=True,
+        updater="reuse",
+        keyframe_interval=4,
+    ))
+    model.temporal_memory["policy_supervision"] = dict(
+        enabled=True,
+        target="similarity",
+        thresholds=(0.9, 0.7, 0.5),
+        weight=1.0,
+    )
+    policy = MlpFramePolicy(
+        checkpoint=None,
+        load_weights=False,
+        feature_names=["ego_speed_mps"],
+        labels=["easy", "medium", "hard", "very_hard"],
+        actions=dict(
+            easy="L8", medium="L12", hard="L16", very_hard="L24"),
+    )
+    model.temporal_memory_controller = TemporalMemoryController(
+        enabled=True, updater="reuse", keyframe_interval=4, policy=policy)
+    model.temporal_memory_policy = policy
+    model.train(True)
+    model._extract_img_feat_temporal_memory(
+        _frame(1.0),
+        [{"scene_token": "scene-a", "ego_speed_mps": 1.0}],
+        training=True,
+    )
+
+    _, losses = model._extract_img_feat_temporal_memory(
+        _frame(2.0),
+        [{"scene_token": "scene-a", "ego_speed_mps": 2.0}],
+        training=True,
+    )
+
+    assert losses["loss_tm_policy"].requires_grad
+    losses["loss_tm_policy"].backward()
+    assert any(param.grad is not None for param in policy.parameters())
+
+
+def test_streampetr_adaptive_motion_reset_forces_full_per_sample():
+    model = make_fake_petr3d(temporal_memory=dict(
+        enabled=True,
+        keyframe_interval=99,
+        updater="reuse",
+    ))
+    model.temporal_memory_controller.adaptive_reset = dict(
+        enabled=True, max_frames_between_full=2, ego_speed_mps=2.0)
+    model.temporal_memory_controller.max_frames_between_full = 4
+    model._extract_img_feat_temporal_memory(
+        _frame(1.0), _metas(), training=False)
+    model._extract_img_feat_temporal_memory(
+        _frame(2.0),
+        [{"scene_token": "scene-a", "ego_speed_mps": 0.5}],
+        training=False,
+    )
+
+    features, _ = model._extract_img_feat_temporal_memory(
+        _frame(3.0),
+        [{"scene_token": "scene-a", "ego_speed_mps": 3.0}],
+        training=False,
+    )
+
+    assert torch.equal(features, _frame(103.0))
+    assert model.full_calls == 2
+
+
+def test_streampetr_freeze_keeps_only_temporal_modules_trainable():
+    from projects.mmdet3d_plugin.models.detectors.petr3d import Petr3D
+
+    model = Petr3D.__new__(Petr3D)
+    torch.nn.Module.__init__(model)
+    model.img_backbone = torch.nn.Linear(2, 2)
+    model.pts_bbox_head = torch.nn.Linear(2, 2)
+    model.temporal_memory_projector = torch.nn.Linear(2, 2)
+    model.temporal_memory_updater = torch.nn.Linear(2, 2)
+    model.temporal_memory_policy = torch.nn.Linear(2, 2)
+
+    model._freeze_temporal_memory_pretrained_detector()
+
+    assert not any(param.requires_grad for param in model.img_backbone.parameters())
+    assert not any(param.requires_grad for param in model.pts_bbox_head.parameters())
+    assert all(param.requires_grad for param in model.temporal_memory_projector.parameters())
+    assert all(param.requires_grad for param in model.temporal_memory_updater.parameters())
+    assert all(param.requires_grad for param in model.temporal_memory_policy.parameters())
+
+
 def test_streampetr_forward_train_uses_one_router_and_collects_distillation():
     from projects.mmdet3d_plugin.models.detectors.petr3d import Petr3D
 
@@ -285,7 +461,8 @@ def test_streampetr_forward_train_uses_one_router_and_collects_distillation():
     routed = []
     seen_features = []
 
-    def route(self, img, img_metas, training=False, prev_exists=None):
+    def route(self, img, img_metas, training=False, prev_exists=None,
+              policy_data=None):
         routed.append((img.clone(), img_metas, training, prev_exists.clone()))
         frame = len(routed)
         losses = {"loss_tm_distill": img.new_tensor(
@@ -329,7 +506,8 @@ def test_streampetr_simple_test_routes_features_before_unchanged_head_path():
     model.temporal_memory_enabled = True
     seen = {}
 
-    def route(self, img, img_metas, training=False, prev_exists=None):
+    def route(self, img, img_metas, training=False, prev_exists=None,
+              policy_data=None):
         seen["route"] = (img, img_metas, training, prev_exists)
         return img + 9.0, {}
 
@@ -339,6 +517,7 @@ def test_streampetr_simple_test_routes_features_before_unchanged_head_path():
 
     model._extract_img_feat_temporal_memory = MethodType(route, model)
     model.simple_test_pts = MethodType(simple_test_pts, model)
+    model.temporal_memory_controller = None
     img = _frame(4.0)
     metas = _metas()
 
