@@ -180,6 +180,43 @@ def test_streampetr_scene_boundary_forces_a_new_full_feature():
     assert list(model.temporal_memory_controller.states) == [("scene-b", 0)]
 
 
+def test_streampetr_discontinuity_clears_stale_policy_state_before_decision():
+    model = make_fake_petr3d(temporal_memory=dict(
+        enabled=True, updater="reuse", keyframe_interval=4))
+    model.temporal_memory["policy_offline_features"] = "teacher_forcing"
+    captured = []
+
+    class CapturePolicy:
+        def decide(self, **kwargs):
+            captured.append(dict(kwargs["policy_features"]))
+            return "L12"
+
+    model.temporal_memory_controller.policy = CapturePolicy()
+    state = model.temporal_memory_controller.states.setdefault(
+        ("scene-a", 0), dict(
+            scene_token="scene-a", frame_index=7, frames_since_full=2,
+            memory=_frame(101.0),
+            prediction_features={"num_annotations": 99.0},
+            prediction_boxes=torch.ones(1, 9),
+            prediction_scores=torch.ones(1),
+            prediction_labels=torch.ones(1, dtype=torch.long),
+            prediction_camera_boxes=[torch.ones(1, 4)],
+            offline_gt_features={"num_annotations": 88.0},
+            policy_state={"timestamp": 123.0},
+            gt_boxes=torch.ones(1, 9),
+            gt_labels=torch.ones(1, dtype=torch.long)))
+
+    model._extract_img_feat_temporal_memory(
+        _frame(2.0), _metas(), training=False,
+        prev_exists=torch.tensor([False]))
+
+    assert captured[0]["is_scene_start"] == 1.0
+    assert captured[0]["num_annotations"] == 0.0
+    assert captured[0]["dt_s"] == 0.0
+    assert "prediction_features" not in state
+    assert "prediction_boxes" not in state
+
+
 def test_streampetr_disabled_preserves_direct_full_path():
     model = make_fake_petr3d(temporal_memory=dict(enabled=False))
     img = _frame(7.0)
@@ -608,6 +645,55 @@ def test_streampetr_prediction_features_threshold_scores_before_statistics():
     assert features["num_annotations"] == 1.0
     assert features["max_object_speed_mps"] == 5.0
     assert features["avg_box_length_m"] == 1.0
+
+
+def test_streampetr_simple_test_derives_camera_schema_from_3d_predictions():
+    model = make_fake_petr3d(temporal_memory=dict(
+        enabled=True, updater="reuse", keyframe_interval=4))
+    model.temporal_memory["policy_prediction_score_thr"] = 0.5
+
+    def simple_test_pts(self, img_metas, **data):
+        return [dict(
+            boxes_3d=torch.tensor([
+                [0.0, 0.0, 10.0, 2.0, 2.0, 2.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 10.0, 4.0, 4.0, 4.0, 0.0, 0.0, 0.0],
+            ]),
+            scores_3d=torch.tensor([0.9, 0.1]),
+            labels_3d=torch.tensor([1, 2]))]
+
+    model.simple_test_pts = MethodType(simple_test_pts, model)
+    lidar2img = torch.tensor([
+        [10.0, 0.0, 50.0, 0.0],
+        [0.0, 10.0, 50.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ])
+    metas = [dict(
+        scene_token="scene-a", sample_idx="sample-0",
+        lidar2img=[lidar2img, lidar2img],
+        img_shape=[(100, 100, 3), (100, 100, 3)])]
+
+    model.simple_test(metas, img=_frame(1.0))
+    features = model.temporal_memory_controller.states[
+        ("scene-a", 0)]["prediction_features"]
+
+    assert features["camera_annotation_count"] == 2.0
+    assert features["max_camera_annotation_count"] == 1.0
+    assert features["min_camera_annotation_count"] == 1.0
+    assert features["avg_camera_annotation_count"] == 1.0
+    assert features["avg_2d_box_area_px"] > 0.0
+    assert features["max_2d_box_area_px"] > 0.0
+    gt_features = model._temporal_memory_offline_features(
+        metas[0], {"gt_bboxes_3d": torch.tensor([
+            [0.0, 0.0, 10.0, 2.0, 2.0, 2.0, 0.0, 0.0, 0.0],
+        ])})
+    camera_fields = (
+        "camera_annotation_count", "max_camera_annotation_count",
+        "min_camera_annotation_count", "avg_camera_annotation_count",
+        "avg_2d_box_area_px", "max_2d_box_area_px",
+    )
+    assert {name: features[name] for name in camera_fields} == {
+        name: gt_features[name] for name in camera_fields}
 
 
 def test_streampetr_parameter_anchor_connects_every_trainable_tm_module():
