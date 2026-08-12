@@ -344,16 +344,122 @@ def test_streampetr_teacher_forcing_uses_previous_gt_then_predictions():
         [{"scene_token": "scene-a"}],
     )
 
-    model.train(True)
-    training = model._temporal_memory_policy_features(
-        {"scene_token": "scene-a"}, {}, state, frame_number=1)
     model.train(False)
+    training = model._temporal_memory_policy_features(
+        {"scene_token": "scene-a"}, {}, state, frame_number=1,
+        training=True)
     inference = model._temporal_memory_policy_features(
-        {"scene_token": "scene-a"}, {}, state, frame_number=1)
+        {"scene_token": "scene-a"}, {}, state, frame_number=1,
+        training=False)
 
     assert training["num_annotations"] == 7.0
     assert inference["num_annotations"] == 3.0
     assert inference["max_object_speed_mps"] == 5.0
+
+
+def test_streampetr_prediction_state_is_causal_and_tracks_transitions():
+    model = make_fake_petr3d(temporal_memory=dict(enabled=True))
+    model.temporal_memory["policy_offline_features"] = "teacher_forcing"
+    state = model.temporal_memory_controller.states.setdefault(
+        ("scene-a", 0), {})
+    first = dict(
+        boxes_3d=torch.tensor([
+            [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0],
+            [10.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 2.0, 0.0],
+        ]),
+        scores_3d=torch.tensor([0.9, 0.8]),
+        labels_3d=torch.tensor([1, 2]),
+    )
+    model._temporal_memory_record_predictions(
+        [first], [{"scene_token": "scene-a"}])
+    before_second_decode = model._temporal_memory_policy_features(
+        {"scene_token": "scene-a"}, {}, state, frame_number=1,
+        training=False)
+    second = dict(
+        boxes_3d=torch.tensor([
+            [0.5, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 3.0, 0.0],
+            [30.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 4.0, 0.0],
+        ]),
+        scores_3d=torch.tensor([0.95, 0.7]),
+        labels_3d=torch.tensor([1, 3]),
+    )
+    model._temporal_memory_record_predictions(
+        [second], [{"scene_token": "scene-a"}])
+    after_second_decode = model._temporal_memory_policy_features(
+        {"scene_token": "scene-a"}, {}, state, frame_number=2,
+        training=False)
+
+    assert before_second_decode["num_annotations"] == 2.0
+    assert before_second_decode["new_object_proxy_count"] == 2.0
+    assert after_second_decode["num_annotations"] == 2.0
+    assert after_second_decode["matched_object_proxy_count"] == 1.0
+    assert after_second_decode["new_object_proxy_count"] == 1.0
+    assert after_second_decode["disappeared_object_proxy_count"] == 1.0
+    assert state["prediction_labels"].tolist() == [1, 3]
+    assert torch.equal(state["prediction_scores"], torch.tensor([0.95, 0.7]))
+
+
+def test_streampetr_transition_matching_uses_global_centers_and_same_class():
+    model = make_fake_petr3d(temporal_memory=dict(enabled=True))
+    state = model.temporal_memory_controller.states.setdefault(
+        ("scene-a", 0), {})
+    identity = torch.eye(4)
+    translated = torch.eye(4)
+    translated[0, 3] = 10.0
+    first = dict(
+        boxes_3d=torch.tensor([
+            [10.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0],
+        ]),
+        scores_3d=torch.tensor([0.9, 0.9]),
+        labels_3d=torch.tensor([1, 2]),
+    )
+    second = dict(
+        boxes_3d=torch.tensor([
+            [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0],
+            [-10.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0],
+        ]),
+        scores_3d=torch.tensor([0.9, 0.9]),
+        labels_3d=torch.tensor([1, 3]),
+    )
+    model._temporal_memory_record_predictions(
+        [first], [{"scene_token": "scene-a", "ego_pose": identity}])
+    model._temporal_memory_record_predictions(
+        [second], [{"scene_token": "scene-a", "ego_pose": translated}])
+
+    assert state["prediction_features"]["matched_object_proxy_count"] == 1.0
+    assert state["prediction_features"]["new_object_proxy_count"] == 1.0
+    assert state["prediction_features"]["disappeared_object_proxy_count"] == 1.0
+    assert state["prediction_boxes"][:, 0].tolist() == [10.0, 0.0]
+
+
+def test_streampetr_gt_transitions_use_global_centers_and_same_class():
+    model = make_fake_petr3d(temporal_memory=dict(enabled=True))
+    identity = torch.eye(4)
+    translated = torch.eye(4)
+    translated[0, 3] = 10.0
+    previous_local = torch.tensor([
+        [10.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+        [0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+    ])
+    previous_global = model._temporal_memory_global_boxes(
+        previous_local, identity)
+    current_local = torch.tensor([
+        [0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+        [-10.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+    ])
+
+    features = model._temporal_memory_offline_features(
+        {}, dict(
+            gt_bboxes_3d=current_local,
+            gt_labels_3d=torch.tensor([1, 3]),
+            ego_pose=translated),
+        previous_boxes=previous_global,
+        previous_labels=torch.tensor([1, 2]))
+
+    assert features["matched_object_proxy_count"] == 1.0
+    assert features["new_object_proxy_count"] == 1.0
+    assert features["disappeared_object_proxy_count"] == 1.0
 
 
 def test_streampetr_policy_supervision_returns_trainable_loss():
@@ -429,6 +535,7 @@ def test_streampetr_online_policy_features_cover_configured_motion_schema():
         {"timestamp": 3.0, "ego_pose": pose},
         previous,
         frame_number=2,
+        training=False,
     )
 
     expected = {
@@ -549,14 +656,39 @@ def test_streampetr_policy_supervision_schedule_bounds_teacher_calls():
     assert model.full_calls == 1
 
 
-def test_streampetr_policy_class_weights_change_normalized_aggregate():
+def test_streampetr_policy_supervision_step_survives_state_dict_resume():
+    from projects.mmdet3d_plugin.models.detectors.petr3d import Petr3D
+
+    first = Petr3D.__new__(Petr3D)
+    torch.nn.Module.__init__(first)
+    first.temporal_memory = dict(policy_supervision=dict(
+        enabled=True, warmup_ratio=0.1, max_train_steps=100))
+    first.register_buffer("_tm_train_step_buffer", torch.tensor(9, dtype=torch.long))
+    payload = first.state_dict()
+
+    resumed = Petr3D.__new__(Petr3D)
+    torch.nn.Module.__init__(resumed)
+    resumed.temporal_memory = first.temporal_memory
+    resumed.register_buffer("_tm_train_step_buffer", torch.tensor(0, dtype=torch.long))
+    resumed.load_state_dict(payload)
+
+    assert int(resumed._tm_train_step_buffer) == 9
+    assert resumed._temporal_memory_policy_supervision_active(training=True)
+    resumed._tm_train_step_buffer.add_(1)
+    assert not resumed._temporal_memory_policy_supervision_active(training=True)
+
+
+def test_streampetr_policy_class_weights_change_single_sample_and_queue_loss():
     model = make_fake_petr3d(temporal_memory=dict(enabled=True))
     losses = [torch.tensor(2.0), torch.tensor(4.0)]
 
+    single = model._temporal_memory_aggregate_policy_losses(
+        [(losses[0], 3.0)])
     weighted = model._temporal_memory_aggregate_policy_losses(
         [(losses[0], 1.0), (losses[1], 3.0)])
 
-    assert weighted.item() == pytest.approx(3.5)
+    assert single.item() == pytest.approx(6.0)
+    assert weighted.item() == pytest.approx(7.0)
 
 
 def test_streampetr_adaptive_motion_reset_forces_full_per_sample():

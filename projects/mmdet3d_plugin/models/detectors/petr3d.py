@@ -79,7 +79,9 @@ class Petr3D(MVXTwoStageDetector):
         self.temporal_memory_projector = None
         self.temporal_memory_updater = None
         self.temporal_memory_policy = None
-        self._tm_train_step = 0
+        self.register_buffer(
+            '_tm_train_step_buffer', torch.zeros((), dtype=torch.long),
+            persistent=True)
         if self.temporal_memory_enabled:
             from projects.mmdet3d_plugin.models.temporal_memory import (
                 TemporalMemoryController,
@@ -246,7 +248,9 @@ class Petr3D(MVXTwoStageDetector):
         return features
 
     @staticmethod
-    def _temporal_memory_object_proxy_features(previous_boxes, current_boxes):
+    def _temporal_memory_object_proxy_features(
+            previous_boxes, current_boxes, previous_labels=None,
+            current_labels=None):
         previous = Petr3D._temporal_memory_box_tensor(previous_boxes)
         current = Petr3D._temporal_memory_box_tensor(current_boxes)
         previous_count = 0 if previous is None else len(previous.reshape(-1, previous.shape[-1]))
@@ -260,12 +264,27 @@ class Petr3D(MVXTwoStageDetector):
             )
         previous = previous.reshape(-1, previous.shape[-1]).float().cpu()
         current = current.reshape(-1, current.shape[-1]).float().cpu()
+        previous_labels = Petr3D._temporal_memory_box_tensor(previous_labels)
+        current_labels = Petr3D._temporal_memory_box_tensor(current_labels)
+        if previous_labels is not None:
+            previous_labels = previous_labels.reshape(-1).cpu()
+        if current_labels is not None:
+            current_labels = current_labels.reshape(-1).cpu()
         used = set()
         matched = 0
-        for box in current:
+        for current_index, box in enumerate(current):
             distances = torch.linalg.vector_norm(previous[:, :2] - box[:2], dim=1)
-            best = int(distances.argmin())
-            if best not in used and float(distances[best]) <= 2.0:
+            candidates = [
+                index for index in range(previous_count)
+                if index not in used and (
+                    previous_labels is None or current_labels is None
+                    or previous_labels[index] == current_labels[current_index])
+            ]
+            if not candidates:
+                continue
+            candidate_distances = distances[candidates]
+            best = candidates[int(candidate_distances.argmin())]
+            if float(distances[best]) <= 2.0:
                 used.add(best)
                 matched += 1
         new_count = current_count - matched
@@ -276,8 +295,27 @@ class Petr3D(MVXTwoStageDetector):
             new_object_proxy_fraction=float(new_count / current_count),
         )
 
+    @staticmethod
+    def _temporal_memory_global_boxes(boxes, ego_pose):
+        boxes = Petr3D._temporal_memory_box_tensor(boxes)
+        pose = Petr3D._temporal_memory_box_tensor(ego_pose)
+        if boxes is None or pose is None or pose.numel() < 16:
+            return boxes
+        transformed = boxes.clone()
+        flat = transformed.reshape(-1, transformed.shape[-1])
+        if flat.numel() == 0 or flat.shape[1] < 3:
+            return transformed
+        pose = pose.reshape(-1, 4, 4)[0].to(
+            device=flat.device, dtype=flat.dtype)
+        homogeneous = torch.cat(
+            [flat[:, :3], torch.ones_like(flat[:, :1])], dim=1)
+        flat[:, :3] = (homogeneous @ pose.transpose(0, 1))[:, :3]
+        return transformed
+
     def _temporal_memory_box_statistics(
-            self, boxes, previous_boxes=None, camera_boxes=None):
+            self, boxes, previous_boxes=None, camera_boxes=None,
+            transition_boxes=None, previous_labels=None,
+            current_labels=None):
         features = self._temporal_memory_zero_offline_features()
         boxes = self._temporal_memory_box_tensor(boxes)
         if boxes is not None and boxes.numel() > 0:
@@ -335,21 +373,34 @@ class Petr3D(MVXTwoStageDetector):
                     max_2d_box_area_px=float(max(areas)),
                 )
         features.update(self._temporal_memory_object_proxy_features(
-            previous_boxes, boxes))
+            previous_boxes,
+            boxes if transition_boxes is None else transition_boxes,
+            previous_labels=previous_labels,
+            current_labels=current_labels))
         return features
 
     def _temporal_memory_offline_features(
-            self, img_meta, policy_data, previous_boxes=None):
+            self, img_meta, policy_data, previous_boxes=None,
+            previous_labels=None):
         boxes = self._temporal_memory_box_tensor(
             policy_data.get('gt_bboxes_3d', img_meta.get('gt_bboxes_3d')))
+        labels = self._temporal_memory_box_tensor(
+            policy_data.get('gt_labels_3d', img_meta.get('gt_labels_3d')))
+        ego_pose = policy_data.get('ego_pose', img_meta.get('ego_pose'))
         return self._temporal_memory_box_statistics(
             boxes,
             previous_boxes=previous_boxes,
-            camera_boxes=policy_data.get('gt_bboxes'))
+            camera_boxes=policy_data.get('gt_bboxes'),
+            transition_boxes=self._temporal_memory_global_boxes(
+                boxes, ego_pose),
+            previous_labels=previous_labels,
+            current_labels=labels)
 
     @staticmethod
-    def _temporal_memory_pose(policy_data):
-        pose = Petr3D._temporal_memory_box_tensor(policy_data.get('ego_pose'))
+    def _temporal_memory_pose(policy_data, img_meta=None):
+        img_meta = img_meta or {}
+        pose = Petr3D._temporal_memory_box_tensor(
+            policy_data.get('ego_pose', img_meta.get('ego_pose')))
         if pose is None or pose.numel() < 16:
             return 0.0, 0.0, 0.0, 0.0
         pose = pose.reshape(-1, 4, 4)[0].float().cpu()
@@ -362,7 +413,7 @@ class Petr3D(MVXTwoStageDetector):
         return (current - previous + math.pi) % (2.0 * math.pi) - math.pi
 
     def _temporal_memory_policy_features(
-            self, img_meta, policy_data, state, frame_number):
+            self, img_meta, policy_data, state, frame_number, training):
         features = {
             key: value for key, value in img_meta.items()
             if isinstance(value, (bool, int, float, str))
@@ -375,7 +426,7 @@ class Petr3D(MVXTwoStageDetector):
             policy_data, 'timestamp', 0)
         timestamp = float(img_meta.get('timestamp', 0.0)
                           if timestamp is None else timestamp)
-        x, y, z, yaw = self._temporal_memory_pose(policy_data)
+        x, y, z, yaw = self._temporal_memory_pose(policy_data, img_meta)
         previous = state.get('policy_state') or {}
         dt = delta = speed = accel = yaw_rate = yaw_accel = 0.0
         if previous:
@@ -404,11 +455,12 @@ class Petr3D(MVXTwoStageDetector):
         if 'ego_pose' not in policy_data and 'ego_speed_mps' in img_meta:
             features['ego_speed_mps'] = float(img_meta['ego_speed_mps'])
         current_offline = self._temporal_memory_offline_features(
-            img_meta, policy_data, previous_boxes=state.get('gt_boxes'))
+            img_meta, policy_data, previous_boxes=state.get('gt_boxes'),
+            previous_labels=state.get('gt_labels'))
         mode = self.temporal_memory.get('policy_offline_features', None)
         if mode == 'teacher_forcing':
             source = (
-                state.get('offline_gt_features') if self.training
+                state.get('offline_gt_features') if training
                 else state.get('prediction_features'))
             features.update(source or self._temporal_memory_zero_offline_features())
         elif mode == 'current_gt':
@@ -418,8 +470,13 @@ class Petr3D(MVXTwoStageDetector):
             timestamp=timestamp, ego_x_m=x, ego_y_m=y, ego_yaw_rad=yaw,
             ego_speed_mps=features['ego_speed_mps'],
             yaw_rate_deg_s=features['yaw_rate_deg_s'])
-        features['_current_gt_boxes'] = self._temporal_memory_box_tensor(
+        current_gt_boxes = self._temporal_memory_box_tensor(
             policy_data.get('gt_bboxes_3d', img_meta.get('gt_bboxes_3d')))
+        features['_current_gt_boxes'] = self._temporal_memory_global_boxes(
+            current_gt_boxes,
+            policy_data.get('ego_pose', img_meta.get('ego_pose')))
+        features['_current_gt_labels'] = self._temporal_memory_box_tensor(
+            policy_data.get('gt_labels_3d', img_meta.get('gt_labels_3d')))
         return features
 
     def _freeze_temporal_memory_pretrained_detector(self):
@@ -435,7 +492,9 @@ class Petr3D(MVXTwoStageDetector):
             for param in module.parameters():
                 param.requires_grad = True
 
-    def _temporal_memory_prediction_features(self, result):
+    def _temporal_memory_prediction_state(
+            self, result, previous_boxes=None, previous_labels=None,
+            ego_pose=None):
         if isinstance(result, dict) and 'pts_bbox' in result:
             result = result['pts_bbox']
         boxes = None if not isinstance(result, dict) else result.get(
@@ -444,16 +503,41 @@ class Petr3D(MVXTwoStageDetector):
         scores = None if not isinstance(result, dict) else result.get(
             'scores_3d')
         scores = self._temporal_memory_box_tensor(scores)
+        labels = None if not isinstance(result, dict) else result.get(
+            'labels_3d')
+        labels = self._temporal_memory_box_tensor(labels)
         if (
             boxes is not None and scores is not None
             and scores.numel() == len(boxes)
         ):
             threshold = float(self.temporal_memory.get(
                 'policy_prediction_score_thr', 0.1))
-            boxes = boxes[scores.reshape(-1).to(boxes.device) >= threshold]
-        return self._temporal_memory_box_statistics(boxes)
+            keep = scores.reshape(-1).to(boxes.device) >= threshold
+            boxes = boxes[keep]
+            scores = scores.reshape(-1)[keep.to(scores.device)]
+            if labels is not None and labels.numel() == len(keep):
+                labels = labels.reshape(-1)[keep.to(labels.device)]
+        camera_boxes = None if not isinstance(result, dict) else result.get(
+            'bboxes_2d', result.get('boxes_2d'))
+        transition_boxes = self._temporal_memory_global_boxes(boxes, ego_pose)
+        return dict(
+            features=self._temporal_memory_box_statistics(
+                boxes, previous_boxes=previous_boxes,
+                camera_boxes=camera_boxes,
+                transition_boxes=transition_boxes,
+                previous_labels=previous_labels,
+                current_labels=labels),
+            boxes=transition_boxes,
+            scores=scores,
+            labels=labels,
+            camera_boxes=camera_boxes,
+        )
 
-    def _temporal_memory_record_predictions(self, bbox_results, img_metas):
+    def _temporal_memory_prediction_features(self, result):
+        return self._temporal_memory_prediction_state(result)['features']
+
+    def _temporal_memory_record_predictions(
+            self, bbox_results, img_metas, policy_data=None):
         controller = self.temporal_memory_controller
         if controller is None:
             return
@@ -461,8 +545,20 @@ class Petr3D(MVXTwoStageDetector):
             sample_key = self._temporal_memory_sample_key(img_meta, index)
             state = controller.states.get(sample_key)
             if state is not None:
-                state['prediction_features'] = (
-                    self._temporal_memory_prediction_features(result))
+                ego_pose = img_meta.get('ego_pose')
+                if ego_pose is None and policy_data is not None:
+                    ego_pose = self._temporal_memory_policy_value(
+                        policy_data, 'ego_pose', index)
+                prediction = self._temporal_memory_prediction_state(
+                    result,
+                    previous_boxes=state.get('prediction_boxes'),
+                    previous_labels=state.get('prediction_labels'),
+                    ego_pose=ego_pose)
+                state['prediction_features'] = prediction['features']
+                state['prediction_boxes'] = prediction['boxes']
+                state['prediction_scores'] = prediction['scores']
+                state['prediction_labels'] = prediction['labels']
+                state['prediction_camera_boxes'] = prediction['camera_boxes']
 
     def _temporal_memory_policy_supervision_loss(
             self, policy_features, previous_teacher, current_teacher):
@@ -505,8 +601,7 @@ class Petr3D(MVXTwoStageDetector):
     @staticmethod
     def _temporal_memory_aggregate_policy_losses(weighted_losses):
         numerator = sum(loss * weight for loss, weight in weighted_losses)
-        denominator = sum(float(weight) for _, weight in weighted_losses)
-        return numerator / max(denominator, 1e-12)
+        return numerator / max(len(weighted_losses), 1)
 
     def _temporal_memory_policy_supervision_active(self, training):
         if not training:
@@ -514,7 +609,10 @@ class Petr3D(MVXTwoStageDetector):
         spec = self.temporal_memory.get('policy_supervision', {}) or {}
         if not spec or spec.get('enabled', True) is False:
             return False
-        step = int(getattr(self, '_tm_train_step', 0))
+        counter = getattr(self, '_tm_train_step_buffer', None)
+        step = (
+            int(counter.item()) if counter is not None
+            else int(getattr(self, '_tm_train_step', 0)))
         max_steps = int(spec.get('max_train_steps', 0) or 0)
         if 'start_train_step' in spec:
             start = int(spec.get('start_train_step', 0) or 0)
@@ -591,7 +689,8 @@ class Petr3D(MVXTwoStageDetector):
                 img_meta,
                 sample_policy_data,
                 state,
-                frame_number=int(state.get('frame_index', 0)))
+                frame_number=int(state.get('frame_index', 0)),
+                training=training)
             action = self._temporal_memory_sample_action(
                 sample_key, scene_token, sample_prev_exists,
                 policy_features=policy_features)
@@ -706,6 +805,8 @@ class Petr3D(MVXTwoStageDetector):
                 '_current_policy_state', {})
             state['gt_boxes'] = route['policy_features'].get(
                 '_current_gt_boxes')
+            state['gt_labels'] = route['policy_features'].get(
+                '_current_gt_labels')
             if policy_teacher is not None:
                 batch_index = route['batch_index']
                 previous_teacher = route['previous_full_teacher']
@@ -999,6 +1100,8 @@ class Petr3D(MVXTwoStageDetector):
                 }
                 if gt_bboxes_3d is not None:
                     frame_policy_data['gt_bboxes_3d'] = gt_bboxes_3d[i]
+                if gt_labels_3d is not None:
+                    frame_policy_data['gt_labels_3d'] = gt_labels_3d[i]
                 if gt_bboxes is not None:
                     frame_policy_data['gt_bboxes'] = gt_bboxes[i]
                 if i < num_nograd_frames:
@@ -1056,7 +1159,12 @@ class Petr3D(MVXTwoStageDetector):
             anchor = self._temporal_memory_parameter_anchor_loss()
             if anchor is not None:
                 losses['loss_tm_param_anchor'] = anchor
-            self._tm_train_step = int(getattr(self, '_tm_train_step', 0)) + 1
+            counter = getattr(self, '_tm_train_step_buffer', None)
+            if counter is not None:
+                counter.add_(1)
+            else:
+                self._tm_train_step = int(
+                    getattr(self, '_tm_train_step', 0)) + 1
 
         return losses
   
@@ -1112,7 +1220,8 @@ class Petr3D(MVXTwoStageDetector):
         for result_dict, pts_bbox in zip(bbox_list, bbox_pts):
             result_dict['pts_bbox'] = pts_bbox
         if self.temporal_memory_enabled:
-            self._temporal_memory_record_predictions(bbox_list, img_metas)
+            self._temporal_memory_record_predictions(
+                bbox_list, img_metas, policy_data=data)
         return bbox_list
 
     
