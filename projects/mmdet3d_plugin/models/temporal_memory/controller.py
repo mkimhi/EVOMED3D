@@ -17,6 +17,7 @@ class TemporalMemoryController:
         distill_weight=1.0,
         inference_teacher_forbidden=True,
         max_frames_between_full=None,
+        adaptive_reset=None,
         profiler=None,
         debug=False,
     ):
@@ -37,7 +38,13 @@ class TemporalMemoryController:
         self.last_action_forced = False
         self.last_distillation_loss = None
         self.max_frames_between_full = max_frames_between_full
-        self._policy_stats = {'forced_l24': 0, 'learned_l24': 0}
+        self.adaptive_reset = adaptive_reset or {}
+        self._policy_stats = {
+            'forced_l24': 0,
+            'forced_age_l24': 0,
+            'forced_motion_l24': 0,
+            'learned_l24': 0,
+        }
         self.policy = build_frame_policy(
             policy,
             keyframe_interval=keyframe_interval,
@@ -77,7 +84,7 @@ class TemporalMemoryController:
             scene_token != self.scene_token
             or not self._prev_exists_all(prev_exists)
         )
-        if self._force_full_for_age(is_reset_frame):
+        if self._force_full_for_age(is_reset_frame, policy_features=policy_features):
             return 'L24'
         return self.policy.decide(
             frame_index=self.frame_index,
@@ -88,10 +95,44 @@ class TemporalMemoryController:
             policy_features=policy_features,
         )
 
-    def _force_full_for_age(self, is_reset_frame=False):
-        if is_reset_frame or self.memory is None or self.max_frames_between_full is None:
+    def _motion_reset_active(self, policy_features=None):
+        cfg = self.adaptive_reset or {}
+        if not cfg or cfg.get('enabled', True) is False or policy_features is None:
             return False
-        return self.frames_since_full >= max(int(self.max_frames_between_full) - 1, 0)
+        checks = (
+            ('ego_speed_mps', 'ego_speed_mps'),
+            ('max_object_speed_mps', 'max_object_speed_mps'),
+            ('avg_object_speed_mps', 'avg_object_speed_mps'),
+        )
+        for feature_name, threshold_name in checks:
+            threshold = cfg.get(threshold_name, None)
+            if threshold is None:
+                continue
+            try:
+                value = float(policy_features.get(feature_name, 0.0) or 0.0)
+            except (TypeError, ValueError):
+                value = 0.0
+            if value >= float(threshold):
+                return True
+        return False
+
+    def _max_frames_for_policy_features(self, policy_features=None):
+        if self._motion_reset_active(policy_features):
+            return (self.adaptive_reset or {}).get(
+                'max_frames_between_full', self.max_frames_between_full)
+        return self.max_frames_between_full
+
+    def _force_full_for_age(self, is_reset_frame=False, policy_features=None):
+        max_frames = self._max_frames_for_policy_features(policy_features)
+        if is_reset_frame or self.memory is None or max_frames is None:
+            return False
+        return self.frames_since_full >= max(int(max_frames) - 1, 0)
+
+    def _force_full_reason(self, is_reset_frame=False, policy_features=None):
+        if not self._force_full_for_age(
+            is_reset_frame, policy_features=policy_features):
+            return None
+        return 'motion' if self._motion_reset_active(policy_features) else 'age'
 
     def policy_stats(self):
         stats = dict(self._policy_stats)
@@ -125,7 +166,9 @@ class TemporalMemoryController:
             scene_token != self.scene_token
             or not self._prev_exists_all(prev_exists)
         )
-        forced = self._force_full_for_age(is_reset_frame)
+        force_reason = self._force_full_reason(
+            is_reset_frame, policy_features=policy_features)
+        forced = force_reason is not None
         action = self.peek_action(scene_token=scene_token, prev_exists=prev_exists, policy_features=policy_features)
         self.last_action = action
         self.last_action_forced = forced
@@ -133,6 +176,12 @@ class TemporalMemoryController:
         is_keyframe = action == 'L24'
         if forced:
             self._policy_stats['forced_l24'] = self._policy_stats.get('forced_l24', 0) + 1
+            if force_reason == 'motion':
+                self._policy_stats['forced_motion_l24'] = (
+                    self._policy_stats.get('forced_motion_l24', 0) + 1)
+            else:
+                self._policy_stats['forced_age_l24'] = (
+                    self._policy_stats.get('forced_age_l24', 0) + 1)
         elif is_keyframe and self.memory is not None:
             self._policy_stats['learned_l24'] = self._policy_stats.get('learned_l24', 0) + 1
 

@@ -1,0 +1,13 @@
+{
+  "ann_file": "data/nuscenes/nuscenes2d_temporal_infos_val.pkl",
+  "baseline_results": "test/repdetr3d_eva02_800_bs2_seq_24e_tm_reuse_k3/Tue_Jul__7_20_28_28_2026/pts_bbox/results_nusc.json",
+  "match_dist": 2.0,
+  "method_results": "val/work_dirs/repdetr3d_eva02_800_bs2_seq_24e_tm_mlp_policy_trainable_4level_reset4_similarity_online_offline_teacher_forcing_feature_noise_no_distill/Tue_Aug__4_06_28_29_2026/pts_bbox/results_nusc.json",
+  "num_samples": 6019,
+  "outputs": {
+    "class_summary_csv": "/home/moshekimhi_google_com/StreamPETR/outputs/failure_cases/repdetr3d_feature_noise_010_vs_full/class_summary.csv",
+    "failure_cases_csv": "/home/moshekimhi_google_com/StreamPETR/outputs/failure_cases/repdetr3d_feature_noise_010_vs_full/failure_cases.csv",
+    "top_failure_cases_csv": "/home/moshekimhi_google_com/StreamPETR/outputs/failure_cases/repdetr3d_feature_noise_010_vs_full/top_failure_cases.csv"
+  },
+  "score_thr": 0.1
+}

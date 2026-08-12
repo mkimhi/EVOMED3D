@@ -307,6 +307,26 @@ def test_repdetr3d_single_training_detaches_cached_memory_between_iterations():
     assert img2.grad is not None
 
 
+def test_repdetr3d_batched_training_motion_reset_uses_policy_features():
+    from projects.mmdet3d_plugin.models.detectors.repdetr3d import RepDetr3D
+    from projects.mmdet3d_plugin.models.temporal_memory import TemporalMemoryController
+
+    model = RepDetr3D.__new__(RepDetr3D)
+    model.temporal_memory_controller = TemporalMemoryController(
+        enabled=True,
+        updater="reuse",
+        policy=dict(type="fixed_interval", keyframe_interval=99, partial_action="L8"),
+        max_frames_between_full=4,
+        adaptive_reset=dict(enabled=True, max_frames_between_full=2, ego_speed_mps=2.0),
+    )
+    state = dict(memory=[torch.ones(1)], frames_since_full=1)
+
+    assert model._temporal_memory_sample_force_full_for_age(
+        state, {"ego_speed_mps": 3.0})
+    assert not model._temporal_memory_sample_force_full_for_age(
+        state, {"ego_speed_mps": 0.1})
+
+
 def test_repdetr3d_training_temporal_path_keeps_distill_loss_key_without_non_keyframes():
     from projects.mmdet3d_plugin.models.detectors.repdetr3d import RepDetr3D
     from projects.mmdet3d_plugin.models.temporal_memory import TemporalMemoryController

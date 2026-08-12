@@ -137,6 +137,7 @@ class RepDetr3D(MVXTwoStageDetector):
                     tm_assert_no_teacher_in_inference),
                 max_frames_between_full=self.temporal_memory.get(
                     'max_frames_between_full', None),
+                adaptive_reset=self.temporal_memory.get('adaptive_reset', None),
                 profiler=self.tm_profiler,
                 debug=tm_debug_shapes)
             if isinstance(self.temporal_memory_controller.updater, torch.nn.Module):
@@ -410,7 +411,7 @@ class RepDetr3D(MVXTwoStageDetector):
                         0 if is_reset_frame else state.get('frame_index', 0)))
                 policy_features.append(features)
                 is_reset_frames.append(is_reset_frame)
-                if is_reset_frame or self._temporal_memory_sample_force_full_for_age(state):
+                if is_reset_frame or self._temporal_memory_sample_force_full_for_age(state, features):
                     action = 'L24'
                 else:
                     action = self.temporal_memory_controller.policy.decide(
@@ -781,6 +782,8 @@ class RepDetr3D(MVXTwoStageDetector):
             count = stats.get(action, 0)
             fields.append(f'{action}={count}({count / total:.3f})')
         fields.append(f'forced_l24={stats.get("forced_l24", 0)}')
+        fields.append(f'forced_age_l24={stats.get("forced_age_l24", 0)}')
+        fields.append(f'forced_motion_l24={stats.get("forced_motion_l24", 0)}')
         fields.append(f'learned_l24={stats.get("learned_l24", 0)}')
         fields.append(f'effective_full_rate={stats.get("L24", 0) / total:.3f}')
         print(f'[temporal_memory_policy] samples={total} ' + ' '.join(fields))
@@ -1272,8 +1275,11 @@ class RepDetr3D(MVXTwoStageDetector):
             return RepDetr3D._temporal_memory_sample_prev_exists(value, 0)
         return bool(prev_exists)
 
-    def _temporal_memory_sample_force_full_for_age(self, state):
-        max_frames = getattr(self.temporal_memory_controller, 'max_frames_between_full', None)
+    def _temporal_memory_sample_force_full_for_age(self, state, policy_features=None):
+        controller = getattr(self, 'temporal_memory_controller', None)
+        if controller is None:
+            return False
+        max_frames = controller._max_frames_for_policy_features(policy_features)
         if max_frames is None:
             return False
         return int(state.get('frames_since_full', 0)) >= max(int(max_frames) - 1, 0)

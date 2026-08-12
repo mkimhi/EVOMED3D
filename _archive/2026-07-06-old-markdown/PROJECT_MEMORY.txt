@@ -1,0 +1,27 @@
+StreamPETR project memory for new work
+Date: 2026-07-06
+
+Evaluation changes to remember:
+
+- tools/test.py imports the repo root early with sys.path.insert so local tools modules can be imported when running the script directly.
+- tools/test.py adds --num_test to evaluate only the first N test instances.
+- tools/test.py calls tools.eval_utils.limit_dataset(dataset, args.num_test) immediately after build_dataset(cfg.data.test).
+- tools/test.py enables non-distributed evaluation again through custom_single_gpu_test instead of asserting false.
+- tools/test.py adds --timing-warmup and passes it to the single-GPU and distributed test loops.
+- tools/eval_utils.py contains limit_dataset. It wraps or mutates the built dataset to shorten evaluation and stores selected nuScenes sample tokens on dataset._eval_sample_tokens.
+- projects/mmdet3d_plugin/core/apis/test.py contains timing helpers and prints per-sample timing summaries for data wait, model forward, result postprocess, result collection, and total loop time.
+- projects/mmdet3d_plugin/core/apis/test.py contains custom_single_gpu_test, matching the custom dict/list result handling used by the distributed path.
+- projects/mmdet3d_plugin/datasets/nuscenes_dataset.py overrides _evaluate_single when _eval_sample_tokens exists. It runs a NuScenesSubsetEval that filters ground truth to prediction/subset tokens so --num_test can produce meaningful metrics instead of requiring the full split.
+- projects/mmdet3d_plugin/datasets/nuscenes_dataset.py also adds ego_speed to get_data_info via _get_ego_speed from consecutive ego poses in the same scene.
+
+Likely commands:
+
+- Partial eval: python tools/test.py CONFIG CHECKPOINT --eval bbox --num_test N
+- Timing eval: add --timing-warmup K
+- Distributed eval: use the existing launcher arguments; custom_multi_gpu_test now accepts timing_warmup.
+
+Important caveats:
+
+- Partial nuScenes metrics are approximate and only useful for quick checks, not final reporting.
+- The subset evaluation depends on prediction sample tokens matching the limited dataset tokens; mismatches print a warning and evaluate prediction tokens.
+- The working tree currently contains many modified and untracked files related to DINO/EVA backbones, routing, RepDETR3D configs, work dirs, checkpoints, and data. Do not assume these are committed.

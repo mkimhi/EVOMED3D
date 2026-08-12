@@ -1,0 +1,20 @@
+Once implemented, run the baseline model like this:
+
+  python tools/export_inference_examples.py \
+    projects/configs/RepDETR3D/repdetr3d_eva02_800_bs4_seq_24e.py \
+    ckpts/repdetr3d_eva02_800_bs4_seq_24e.pth \
+    --num-scenes 3 \
+    --frames-per-scene 5 \
+    --feature-layer 8 \
+    --output-dir inferece_example
+
+  For ten frames per scene, change to:
+
+  --frames-per-scene 10
+
+  For the best temporal experiment:
+
+  python tools/export_inference_examples.py \
+    projects/configs/RepDETR3D/repdetr3d_eva02_800_bs2_seq_24e_tm_mlp_policy_trainable_4level_reset5_similarity_online_offline_teacher_forcing_no_distill.py \
+    PATH_TO_BEST_CHECKPOINT.pth \
+    --output-dir inferece_example

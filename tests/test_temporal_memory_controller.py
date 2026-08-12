@@ -361,6 +361,85 @@ def test_controller_forces_l24_every_configured_number_of_frames():
     assert controller.policy_stats()["forced_l24"] == 1
 
 
+def test_controller_motion_reset_forces_l24_when_motion_features_are_high():
+    from projects.mmdet3d_plugin.models.temporal_memory import TemporalMemoryController
+
+    controller = TemporalMemoryController(
+        enabled=True,
+        updater="reuse",
+        policy=dict(type="fixed_interval", keyframe_interval=99, partial_action="L8"),
+        max_frames_between_full=4,
+        adaptive_reset=dict(
+            enabled=True,
+            max_frames_between_full=2,
+            ego_speed_mps=2.0,
+            max_object_speed_mps=5.0,
+        ),
+    )
+
+    assert controller.peek_action(
+        scene_token="scene-a",
+        policy_features={"ego_speed_mps": 0.0, "max_object_speed_mps": 0.0},
+    ) == "L24"
+    controller.get_or_update(lambda: "full", scene_token="scene-a")
+    assert controller.peek_action(
+        scene_token="scene-a",
+        policy_features={"ego_speed_mps": 0.1, "max_object_speed_mps": 0.0},
+    ) == "L8"
+    assert controller.peek_action(
+        scene_token="scene-a",
+        policy_features={"ego_speed_mps": 3.0, "max_object_speed_mps": 0.0},
+    ) == "L8"
+    controller.get_or_update(
+        lambda: "full",
+        scene_token="scene-a",
+        policy_features={"ego_speed_mps": 3.0, "max_object_speed_mps": 0.0},
+    )
+
+    assert controller.peek_action(
+        scene_token="scene-a",
+        policy_features={"ego_speed_mps": 3.0, "max_object_speed_mps": 0.0},
+    ) == "L24"
+    controller.get_or_update(
+        lambda: "full",
+        scene_token="scene-a",
+        policy_features={"ego_speed_mps": 3.0, "max_object_speed_mps": 0.0},
+    )
+
+    stats = controller.policy_stats()
+    assert stats["forced_motion_l24"] == 1
+    assert stats["forced_l24"] == 1
+
+
+def test_controller_motion_reset_can_use_previous_object_speed():
+    from projects.mmdet3d_plugin.models.temporal_memory import TemporalMemoryController
+
+    controller = TemporalMemoryController(
+        enabled=True,
+        updater="reuse",
+        policy=dict(type="fixed_interval", keyframe_interval=99, partial_action="L8"),
+        max_frames_between_full=4,
+        adaptive_reset=dict(
+            enabled=True,
+            max_frames_between_full=2,
+            ego_speed_mps=2.0,
+            max_object_speed_mps=5.0,
+        ),
+    )
+
+    controller.get_or_update(lambda: "full", scene_token="scene-a")
+    controller.get_or_update(
+        lambda: "full",
+        scene_token="scene-a",
+        policy_features={"ego_speed_mps": 0.0, "max_object_speed_mps": 6.0},
+    )
+
+    assert controller.peek_action(
+        scene_token="scene-a",
+        policy_features={"ego_speed_mps": 0.0, "max_object_speed_mps": 6.0},
+    ) == "L24"
+
+
 def test_controller_passes_policy_features_to_mlp_policy(tmp_path):
     import torch
     from projects.mmdet3d_plugin.models.temporal_memory import TemporalMemoryController
