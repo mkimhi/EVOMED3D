@@ -334,6 +334,11 @@ class Petr3D(MVXTwoStageDetector):
                 lidar2img = list(lidar2img)
         if not isinstance(lidar2img, (list, tuple)):
             return None
+        if torch.is_tensor(image_shapes):
+            if image_shapes.dim() == 1:
+                image_shapes = [image_shapes]
+            elif image_shapes.dim() == 2:
+                image_shapes = list(image_shapes)
         if (
             isinstance(image_shapes, tuple) and image_shapes
             and isinstance(image_shapes[0], (int, float))
@@ -384,6 +389,17 @@ class Petr3D(MVXTwoStageDetector):
                 torch.stack(camera_boxes) if camera_boxes
                 else torch.empty((0, 4), dtype=boxes.dtype))
         return per_camera
+
+    @staticmethod
+    def _temporal_memory_projection_meta(img_meta, policy_data):
+        projection_meta = dict(img_meta or {})
+        for name in ('lidar2img', 'img_shape', 'pad_shape'):
+            if (
+                projection_meta.get(name) is None
+                and policy_data.get(name) is not None
+            ):
+                projection_meta[name] = policy_data[name]
+        return projection_meta
 
     def _temporal_memory_box_statistics(
             self, boxes, previous_boxes=None, camera_boxes=None,
@@ -460,8 +476,10 @@ class Petr3D(MVXTwoStageDetector):
         labels = self._temporal_memory_box_tensor(
             policy_data.get('gt_labels_3d', img_meta.get('gt_labels_3d')))
         ego_pose = policy_data.get('ego_pose', img_meta.get('ego_pose'))
+        projection_meta = self._temporal_memory_projection_meta(
+            img_meta, policy_data)
         projected_camera_boxes = self._temporal_memory_project_boxes_to_cameras(
-            boxes, img_meta)
+            boxes, projection_meta)
         return self._temporal_memory_box_statistics(
             boxes,
             previous_boxes=previous_boxes,
@@ -630,12 +648,20 @@ class Petr3D(MVXTwoStageDetector):
                 if ego_pose is None and policy_data is not None:
                     ego_pose = self._temporal_memory_policy_value(
                         policy_data, 'ego_pose', index)
+                sample_projection_data = {
+                    name: self._temporal_memory_policy_value(
+                        policy_data, name, index)
+                    for name in ('lidar2img', 'img_shape', 'pad_shape')
+                    if policy_data is not None and name in policy_data
+                }
+                projection_meta = self._temporal_memory_projection_meta(
+                    img_meta, sample_projection_data)
                 prediction = self._temporal_memory_prediction_state(
                     result,
                     previous_boxes=state.get('prediction_boxes'),
                     previous_labels=state.get('prediction_labels'),
                     ego_pose=ego_pose,
-                    img_meta=img_meta)
+                    img_meta=projection_meta)
                 state['prediction_features'] = prediction['features']
                 state['prediction_boxes'] = prediction['boxes']
                 state['prediction_scores'] = prediction['scores']

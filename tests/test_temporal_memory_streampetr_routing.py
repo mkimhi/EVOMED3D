@@ -696,6 +696,58 @@ def test_streampetr_simple_test_derives_camera_schema_from_3d_predictions():
         name: gt_features[name] for name in camera_fields}
 
 
+def test_streampetr_simple_test_uses_collected_calibration_outside_metas():
+    model = make_fake_petr3d(temporal_memory=dict(
+        enabled=True, updater="reuse", keyframe_interval=4))
+
+    def simple_test_pts(self, img_metas, **data):
+        return [dict(
+            boxes_3d=torch.tensor([
+                [0.0, 0.0, 10.0, 2.0, 2.0, 2.0, 0.0, 0.0, 0.0],
+            ]),
+            scores_3d=torch.tensor([0.9]),
+            labels_3d=torch.tensor([1]))]
+
+    model.simple_test_pts = MethodType(simple_test_pts, model)
+    calibration = torch.tensor([
+        [10.0, 0.0, 50.0, 0.0],
+        [0.0, 10.0, 50.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ])
+    metas = [dict(scene_token="scene-a", sample_idx="sample-0")]
+
+    model.simple_test(
+        metas,
+        img=_frame(1.0),
+        lidar2img=torch.stack([calibration, calibration]).unsqueeze(0),
+        img_shape=torch.tensor([[[100, 100, 3], [100, 100, 3]]]),
+    )
+    features = model.temporal_memory_controller.states[
+        ("scene-a", 0)]["prediction_features"]
+
+    assert features["camera_annotation_count"] == 2.0
+    assert features["max_camera_annotation_count"] == 1.0
+    assert features["min_camera_annotation_count"] == 1.0
+    assert features["avg_camera_annotation_count"] == 1.0
+    assert features["avg_2d_box_area_px"] > 0.0
+    assert features["max_2d_box_area_px"] > 0.0
+    gt_features = model._temporal_memory_offline_features(
+        metas[0], dict(
+            gt_bboxes_3d=torch.tensor([
+                [0.0, 0.0, 10.0, 2.0, 2.0, 2.0, 0.0, 0.0, 0.0],
+            ]),
+            lidar2img=torch.stack([calibration, calibration]),
+            img_shape=torch.tensor([[100, 100, 3], [100, 100, 3]])))
+    camera_fields = (
+        "camera_annotation_count", "max_camera_annotation_count",
+        "min_camera_annotation_count", "avg_camera_annotation_count",
+        "avg_2d_box_area_px", "max_2d_box_area_px",
+    )
+    assert {name: features[name] for name in camera_fields} == {
+        name: gt_features[name] for name in camera_fields}
+
+
 def test_streampetr_parameter_anchor_connects_every_trainable_tm_module():
     from projects.mmdet3d_plugin.models.detectors.petr3d import Petr3D
 
