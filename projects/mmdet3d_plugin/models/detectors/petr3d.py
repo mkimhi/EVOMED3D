@@ -9,6 +9,8 @@
 # ------------------------------------------------------------------------
 #  Modified by Shihao Wang
 # ------------------------------------------------------------------------
+import math
+
 import torch
 import torch.nn.functional as F
 from mmcv.runner import force_fp32, auto_fp16
@@ -77,6 +79,7 @@ class Petr3D(MVXTwoStageDetector):
         self.temporal_memory_projector = None
         self.temporal_memory_updater = None
         self.temporal_memory_policy = None
+        self._tm_train_step = 0
         if self.temporal_memory_enabled:
             from projects.mmdet3d_plugin.models.temporal_memory import (
                 TemporalMemoryController,
@@ -222,18 +225,141 @@ class Petr3D(MVXTwoStageDetector):
             return boxes.detach()
         return None
 
-    def _temporal_memory_offline_features(self, img_meta, policy_data):
+    @staticmethod
+    def _temporal_memory_zero_offline_features():
+        names = (
+            'num_annotations', 'avg_object_distance_m',
+            'median_object_distance_m', 'min_object_distance_m',
+            'p10_object_distance_m', 'p90_object_distance_m',
+            'avg_box_length_m', 'avg_box_width_m', 'avg_box_height_m',
+            'avg_box_volume_m3', 'avg_box_area_m2',
+            'avg_object_speed_mps', 'max_object_speed_mps',
+            'camera_annotation_count', 'max_camera_annotation_count',
+            'min_camera_annotation_count', 'avg_camera_annotation_count',
+            'avg_2d_box_area_px', 'max_2d_box_area_px',
+            'new_object_proxy_count', 'matched_object_proxy_count',
+            'disappeared_object_proxy_count', 'new_object_proxy_fraction',
+        )
+        features = {name: 0.0 for name in names}
+        for distance in (10, 20, 30, 50):
+            features[f'near_object_count_{distance}m'] = 0.0
+        return features
+
+    @staticmethod
+    def _temporal_memory_object_proxy_features(previous_boxes, current_boxes):
+        previous = Petr3D._temporal_memory_box_tensor(previous_boxes)
+        current = Petr3D._temporal_memory_box_tensor(current_boxes)
+        previous_count = 0 if previous is None else len(previous.reshape(-1, previous.shape[-1]))
+        current_count = 0 if current is None else len(current.reshape(-1, current.shape[-1]))
+        if previous_count == 0 or current_count == 0:
+            return dict(
+                new_object_proxy_count=float(current_count),
+                matched_object_proxy_count=0.0,
+                disappeared_object_proxy_count=float(previous_count),
+                new_object_proxy_fraction=float(bool(current_count)),
+            )
+        previous = previous.reshape(-1, previous.shape[-1]).float().cpu()
+        current = current.reshape(-1, current.shape[-1]).float().cpu()
+        used = set()
+        matched = 0
+        for box in current:
+            distances = torch.linalg.vector_norm(previous[:, :2] - box[:2], dim=1)
+            best = int(distances.argmin())
+            if best not in used and float(distances[best]) <= 2.0:
+                used.add(best)
+                matched += 1
+        new_count = current_count - matched
+        return dict(
+            new_object_proxy_count=float(new_count),
+            matched_object_proxy_count=float(matched),
+            disappeared_object_proxy_count=float(previous_count - matched),
+            new_object_proxy_fraction=float(new_count / current_count),
+        )
+
+    def _temporal_memory_box_statistics(
+            self, boxes, previous_boxes=None, camera_boxes=None):
+        features = self._temporal_memory_zero_offline_features()
+        boxes = self._temporal_memory_box_tensor(boxes)
+        if boxes is not None and boxes.numel() > 0:
+            boxes = boxes.reshape(-1, boxes.shape[-1]).float().cpu()
+            distances = torch.linalg.vector_norm(boxes[:, :2], dim=1)
+            features.update(
+                num_annotations=float(len(boxes)),
+                avg_object_distance_m=float(distances.mean()),
+                median_object_distance_m=float(distances.median()),
+                min_object_distance_m=float(distances.min()),
+                p10_object_distance_m=float(torch.quantile(distances, 0.1)),
+                p90_object_distance_m=float(torch.quantile(distances, 0.9)),
+            )
+            for distance in (10, 20, 30, 50):
+                features[f'near_object_count_{distance}m'] = float(
+                    (distances < distance).sum())
+            if boxes.shape[1] >= 6:
+                dims = boxes[:, 3:6].abs()
+                features.update(
+                    avg_box_length_m=float(dims[:, 0].mean()),
+                    avg_box_width_m=float(dims[:, 1].mean()),
+                    avg_box_height_m=float(dims[:, 2].mean()),
+                    avg_box_volume_m3=float(dims.prod(dim=1).mean()),
+                    avg_box_area_m2=float((dims[:, 0] * dims[:, 1]).mean()),
+                )
+            if boxes.shape[1] >= 9:
+                speeds = torch.linalg.vector_norm(boxes[:, 7:9], dim=1)
+                features.update(
+                    avg_object_speed_mps=float(speeds.mean()),
+                    max_object_speed_mps=float(speeds.max()),
+                )
+        if isinstance(camera_boxes, (list, tuple)):
+            counts = []
+            areas = []
+            for item in camera_boxes:
+                item = self._temporal_memory_box_tensor(item)
+                if item is None or item.numel() == 0:
+                    counts.append(0)
+                    continue
+                item = item.reshape(-1, item.shape[-1]).float()
+                counts.append(len(item))
+                if item.shape[1] >= 4:
+                    areas.extend(((item[:, 2] - item[:, 0]).abs()
+                                  * (item[:, 3] - item[:, 1]).abs()).tolist())
+            if counts:
+                features.update(
+                    camera_annotation_count=float(sum(counts)),
+                    max_camera_annotation_count=float(max(counts)),
+                    min_camera_annotation_count=float(min(counts)),
+                    avg_camera_annotation_count=float(sum(counts) / len(counts)),
+                )
+            if areas:
+                features.update(
+                    avg_2d_box_area_px=float(sum(areas) / len(areas)),
+                    max_2d_box_area_px=float(max(areas)),
+                )
+        features.update(self._temporal_memory_object_proxy_features(
+            previous_boxes, boxes))
+        return features
+
+    def _temporal_memory_offline_features(
+            self, img_meta, policy_data, previous_boxes=None):
         boxes = self._temporal_memory_box_tensor(
             policy_data.get('gt_bboxes_3d', img_meta.get('gt_bboxes_3d')))
-        if boxes is None or boxes.numel() == 0:
-            return {'num_annotations': 0.0, 'max_object_speed_mps': 0.0}
-        boxes = boxes.reshape(-1, boxes.shape[-1]).float()
-        features = {'num_annotations': float(len(boxes))}
-        if boxes.shape[1] >= 9:
-            speeds = torch.linalg.vector_norm(boxes[:, 7:9], dim=1)
-            features['max_object_speed_mps'] = float(speeds.max())
-            features['avg_object_speed_mps'] = float(speeds.mean())
-        return features
+        return self._temporal_memory_box_statistics(
+            boxes,
+            previous_boxes=previous_boxes,
+            camera_boxes=policy_data.get('gt_bboxes'))
+
+    @staticmethod
+    def _temporal_memory_pose(policy_data):
+        pose = Petr3D._temporal_memory_box_tensor(policy_data.get('ego_pose'))
+        if pose is None or pose.numel() < 16:
+            return 0.0, 0.0, 0.0, 0.0
+        pose = pose.reshape(-1, 4, 4)[0].float().cpu()
+        return (
+            float(pose[0, 3]), float(pose[1, 3]), float(pose[2, 3]),
+            math.atan2(float(pose[1, 0]), float(pose[0, 0])))
+
+    @staticmethod
+    def _temporal_memory_yaw_delta(previous, current):
+        return (current - previous + math.pi) % (2.0 * math.pi) - math.pi
 
     def _temporal_memory_policy_features(
             self, img_meta, policy_data, state, frame_number):
@@ -245,27 +371,55 @@ class Petr3D(MVXTwoStageDetector):
         features.setdefault('info_frame_idx', float(
             img_meta.get('frame_idx', frame_number)))
         features['is_scene_start'] = float(not state or state.get('memory') is None)
-        for name in ('timestamp', 'ego_speed_mps', 'max_object_speed_mps'):
-            value = self._temporal_memory_policy_value(
-                policy_data, name, 0)
-            if value is not None and not torch.is_tensor(value):
-                features[name] = float(value)
-        features.setdefault('ego_speed_mps', float(
-            img_meta.get('ego_speed_mps', img_meta.get('ego_speed', 0.0))))
+        timestamp = self._temporal_memory_policy_value(
+            policy_data, 'timestamp', 0)
+        timestamp = float(img_meta.get('timestamp', 0.0)
+                          if timestamp is None else timestamp)
+        x, y, z, yaw = self._temporal_memory_pose(policy_data)
+        previous = state.get('policy_state') or {}
+        dt = delta = speed = accel = yaw_rate = yaw_accel = 0.0
+        if previous:
+            raw_dt = timestamp - float(previous.get('timestamp', timestamp))
+            dt = raw_dt / 1e6 if abs(raw_dt) > 1000.0 else raw_dt
+            if dt > 0.0:
+                delta = math.hypot(
+                    x - float(previous.get('ego_x_m', x)),
+                    y - float(previous.get('ego_y_m', y)))
+                speed = delta / dt
+                yaw_rate = math.degrees(self._temporal_memory_yaw_delta(
+                    float(previous.get('ego_yaw_rad', yaw)), yaw)) / dt
+                accel = (speed - float(
+                    previous.get('ego_speed_mps', 0.0))) / dt
+                yaw_accel = (yaw_rate - float(
+                    previous.get('yaw_rate_deg_s', 0.0))) / dt
+        features.update(
+            dt_s=float(dt), ego_x_m=x, ego_y_m=y, ego_z_m=z,
+            ego_yaw_deg=float(math.degrees(yaw)),
+            delta_ego_translation_m=float(delta), ego_speed_mps=float(speed),
+            ego_accel_mps2=float(accel), yaw_rate_deg_s=float(yaw_rate),
+            abs_yaw_rate_deg_s=float(abs(yaw_rate)),
+            yaw_accel_deg_s2=float(yaw_accel),
+            abs_yaw_accel_deg_s2=float(abs(yaw_accel)),
+        )
+        if 'ego_pose' not in policy_data and 'ego_speed_mps' in img_meta:
+            features['ego_speed_mps'] = float(img_meta['ego_speed_mps'])
         current_offline = self._temporal_memory_offline_features(
-            img_meta, policy_data)
+            img_meta, policy_data, previous_boxes=state.get('gt_boxes'))
         mode = self.temporal_memory.get('policy_offline_features', None)
         if mode == 'teacher_forcing':
             source = (
                 state.get('offline_gt_features') if self.training
                 else state.get('prediction_features'))
-            features.update(source or {
-                'num_annotations': 0.0,
-                'max_object_speed_mps': 0.0,
-            })
+            features.update(source or self._temporal_memory_zero_offline_features())
         elif mode == 'current_gt':
             features.update(current_offline)
         features['_current_offline_features'] = current_offline
+        features['_current_policy_state'] = dict(
+            timestamp=timestamp, ego_x_m=x, ego_y_m=y, ego_yaw_rad=yaw,
+            ego_speed_mps=features['ego_speed_mps'],
+            yaw_rate_deg_s=features['yaw_rate_deg_s'])
+        features['_current_gt_boxes'] = self._temporal_memory_box_tensor(
+            policy_data.get('gt_bboxes_3d', img_meta.get('gt_bboxes_3d')))
         return features
 
     def _freeze_temporal_memory_pretrained_detector(self):
@@ -287,15 +441,17 @@ class Petr3D(MVXTwoStageDetector):
         boxes = None if not isinstance(result, dict) else result.get(
             'boxes_3d', result.get('bboxes_3d'))
         boxes = self._temporal_memory_box_tensor(boxes)
-        if boxes is None or boxes.numel() == 0:
-            return {'num_annotations': 0.0, 'max_object_speed_mps': 0.0}
-        boxes = boxes.reshape(-1, boxes.shape[-1]).float()
-        features = {'num_annotations': float(len(boxes))}
-        if boxes.shape[1] >= 9:
-            speeds = torch.linalg.vector_norm(boxes[:, 7:9], dim=1)
-            features['max_object_speed_mps'] = float(speeds.max())
-            features['avg_object_speed_mps'] = float(speeds.mean())
-        return features
+        scores = None if not isinstance(result, dict) else result.get(
+            'scores_3d')
+        scores = self._temporal_memory_box_tensor(scores)
+        if (
+            boxes is not None and scores is not None
+            and scores.numel() == len(boxes)
+        ):
+            threshold = float(self.temporal_memory.get(
+                'policy_prediction_score_thr', 0.1))
+            boxes = boxes[scores.reshape(-1).to(boxes.device) >= threshold]
+        return self._temporal_memory_box_statistics(boxes)
 
     def _temporal_memory_record_predictions(self, bbox_results, img_metas):
         controller = self.temporal_memory_controller
@@ -326,7 +482,9 @@ class Petr3D(MVXTwoStageDetector):
             1 if value >= thresholds[1] else
             2 if value >= thresholds[2] else 3)
         policy_inputs = dict(policy_features)
-        policy_inputs.pop('_current_offline_features', None)
+        for key in list(policy_inputs):
+            if key.startswith('_'):
+                policy_inputs.pop(key)
         feature_noise_std = float(spec.get('feature_noise_std', 0.0) or 0.0)
         if feature_noise_std > 0.0:
             scale = policy.scale.detach().float().cpu()
@@ -336,13 +494,52 @@ class Petr3D(MVXTwoStageDetector):
         logits = policy.logits(policy_inputs)
         target = torch.as_tensor(
             [target_index], dtype=torch.long, device=logits.device)
-        class_weights = spec.get('class_weights', None)
-        weights = None
-        if class_weights is not None:
-            weights = torch.as_tensor(
-                class_weights, dtype=logits.dtype, device=logits.device)
-        return F.cross_entropy(logits, target, weight=weights) * float(
+        loss = F.cross_entropy(logits, target, reduction='none')[0] * float(
             spec.get('weight', 1.0))
+        class_weights = spec.get('class_weights', None)
+        sample_weight = 1.0
+        if class_weights is not None:
+            sample_weight = float(class_weights[target_index])
+        return loss, sample_weight
+
+    @staticmethod
+    def _temporal_memory_aggregate_policy_losses(weighted_losses):
+        numerator = sum(loss * weight for loss, weight in weighted_losses)
+        denominator = sum(float(weight) for _, weight in weighted_losses)
+        return numerator / max(denominator, 1e-12)
+
+    def _temporal_memory_policy_supervision_active(self, training):
+        if not training:
+            return False
+        spec = self.temporal_memory.get('policy_supervision', {}) or {}
+        if not spec or spec.get('enabled', True) is False:
+            return False
+        step = int(getattr(self, '_tm_train_step', 0))
+        max_steps = int(spec.get('max_train_steps', 0) or 0)
+        if 'start_train_step' in spec:
+            start = int(spec.get('start_train_step', 0) or 0)
+            return step >= start and (max_steps <= 0 or step < max_steps)
+        if max_steps <= 0:
+            return True
+        warmup_steps = max(
+            1, int(max_steps * float(spec.get('warmup_ratio', 0.1))))
+        return step < warmup_steps
+
+    def _temporal_memory_parameter_anchor_loss(self):
+        anchor = None
+        for module in (
+            getattr(self, 'temporal_memory_projector', None),
+            getattr(self, 'temporal_memory_updater', None),
+            getattr(self, 'temporal_memory_policy', None),
+        ):
+            if not isinstance(module, torch.nn.Module):
+                continue
+            for param in module.parameters():
+                if not param.requires_grad:
+                    continue
+                value = param.float().sum() * 0.0
+                anchor = value if anchor is None else anchor + value
+        return anchor
 
     def _temporal_memory_evict_stale_stream(self, sample_key):
         """Drop the previous scene's cache for the same batch stream slot."""
@@ -488,7 +685,7 @@ class Petr3D(MVXTwoStageDetector):
 
         policy_spec = self.temporal_memory.get('policy_supervision', {}) or {}
         policy_supervision = bool(
-            training and policy_spec.get('enabled', False)
+            self._temporal_memory_policy_supervision_active(training)
             and policy_spec.get('target', 'similarity') in (
                 'similarity', 'similarity_L24_mean'))
         policy_teacher = None
@@ -505,6 +702,10 @@ class Petr3D(MVXTwoStageDetector):
             state = self.temporal_memory_controller.states[route['sample_key']]
             state['offline_gt_features'] = route['policy_features'].get(
                 '_current_offline_features', {})
+            state['policy_state'] = route['policy_features'].get(
+                '_current_policy_state', {})
+            state['gt_boxes'] = route['policy_features'].get(
+                '_current_gt_boxes')
             if policy_teacher is not None:
                 batch_index = route['batch_index']
                 previous_teacher = route['previous_full_teacher']
@@ -519,7 +720,8 @@ class Petr3D(MVXTwoStageDetector):
         features = torch.cat(outputs, dim=0)
         losses = {}
         if policy_losses:
-            losses['loss_tm_policy'] = sum(policy_losses) / len(policy_losses)
+            losses['loss_tm_policy'] = (
+                self._temporal_memory_aggregate_policy_losses(policy_losses))
         if (
             training
             and self.temporal_memory_controller.train_with_teacher
@@ -789,6 +991,16 @@ class Petr3D(MVXTwoStageDetector):
                 frame_prev_exists = data.get('prev_exists', None)
                 if frame_prev_exists is not None:
                     frame_prev_exists = frame_prev_exists[:, i]
+                frame_policy_data = {
+                    key: value[:, i]
+                    for key, value in data.items()
+                    if key != 'img' and torch.is_tensor(value)
+                    and value.dim() >= 2
+                }
+                if gt_bboxes_3d is not None:
+                    frame_policy_data['gt_bboxes_3d'] = gt_bboxes_3d[i]
+                if gt_bboxes is not None:
+                    frame_policy_data['gt_bboxes'] = gt_bboxes[i]
                 if i < num_nograd_frames:
                     self.eval()
                     with torch.no_grad():
@@ -797,12 +1009,7 @@ class Petr3D(MVXTwoStageDetector):
                                 data['img'][:, i], img_metas[i],
                                 training=True,
                                 prev_exists=frame_prev_exists,
-                                policy_data={
-                                    key: value[:, i]
-                                    for key, value in data.items()
-                                    if key != 'img' and torch.is_tensor(value)
-                                    and value.dim() >= 2
-                                }))
+                                policy_data=frame_policy_data))
                     self.train()
                 else:
                     features, frame_tm_losses = (
@@ -810,12 +1017,7 @@ class Petr3D(MVXTwoStageDetector):
                             data['img'][:, i], img_metas[i],
                             training=True,
                             prev_exists=frame_prev_exists,
-                            policy_data={
-                                key: value[:, i]
-                                for key, value in data.items()
-                                if key != 'img' and torch.is_tensor(value)
-                                and value.dim() >= 2
-                            }))
+                            policy_data=frame_policy_data))
                 frame_features.append(features)
                 tm_loss = frame_tm_losses.get('loss_tm_distill')
                 if tm_loss is not None and tm_loss.requires_grad:
@@ -850,6 +1052,11 @@ class Petr3D(MVXTwoStageDetector):
         if tm_policy_losses:
             losses['loss_tm_policy'] = (
                 sum(tm_policy_losses) / len(tm_policy_losses))
+        if self.temporal_memory_enabled:
+            anchor = self._temporal_memory_parameter_anchor_loss()
+            if anchor is not None:
+                losses['loss_tm_param_anchor'] = anchor
+            self._tm_train_step = int(getattr(self, '_tm_train_step', 0)) + 1
 
         return losses
   

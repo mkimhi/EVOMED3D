@@ -1,4 +1,5 @@
 import sys
+import math
 from pathlib import Path
 from types import MethodType
 
@@ -399,6 +400,163 @@ def test_streampetr_policy_supervision_returns_trainable_loss():
     assert losses["loss_tm_policy"].requires_grad
     losses["loss_tm_policy"].backward()
     assert any(param.grad is not None for param in policy.parameters())
+
+
+def test_streampetr_online_policy_features_cover_configured_motion_schema():
+    model = make_fake_petr3d(temporal_memory=dict(enabled=True))
+    previous = dict(
+        memory=torch.ones(1),
+        policy_state=dict(
+            timestamp=1.0,
+            ego_x_m=0.0,
+            ego_y_m=0.0,
+            ego_yaw_rad=0.0,
+            ego_speed_mps=0.0,
+            yaw_rate_deg_s=0.0,
+        ),
+    )
+    pose = torch.eye(4)
+    pose[0, 0] = 0.0
+    pose[0, 1] = -1.0
+    pose[1, 0] = 1.0
+    pose[1, 1] = 0.0
+    pose[0, 3] = 3.0
+    pose[1, 3] = 4.0
+    pose[2, 3] = 5.0
+
+    features = model._temporal_memory_policy_features(
+        {"scene_token": "scene-a", "frame_idx": 8},
+        {"timestamp": 3.0, "ego_pose": pose},
+        previous,
+        frame_number=2,
+    )
+
+    expected = {
+        "frame_number", "info_frame_idx", "is_scene_start", "dt_s",
+        "ego_x_m", "ego_y_m", "ego_z_m", "ego_yaw_deg",
+        "delta_ego_translation_m", "ego_speed_mps", "ego_accel_mps2",
+        "yaw_rate_deg_s", "abs_yaw_rate_deg_s", "yaw_accel_deg_s2",
+        "abs_yaw_accel_deg_s2",
+    }
+    assert expected <= features.keys()
+    assert features["dt_s"] == 2.0
+    assert features["delta_ego_translation_m"] == 5.0
+    assert features["ego_speed_mps"] == 2.5
+    assert features["ego_accel_mps2"] == 1.25
+    assert features["ego_yaw_deg"] == pytest.approx(90.0)
+    assert features["yaw_rate_deg_s"] == pytest.approx(45.0)
+    assert features["yaw_accel_deg_s2"] == pytest.approx(22.5)
+
+
+def test_streampetr_offline_features_cover_declared_gt_schema():
+    model = make_fake_petr3d(temporal_memory=dict(enabled=True))
+    boxes = torch.tensor([
+        [3.0, 4.0, 0.0, 2.0, 3.0, 4.0, 0.0, 3.0, 4.0],
+        [6.0, 8.0, 0.0, 4.0, 5.0, 6.0, 0.0, 0.0, 2.0],
+    ])
+    camera_boxes = [
+        torch.tensor([[0.0, 0.0, 10.0, 20.0]]),
+        torch.tensor([[0.0, 0.0, 20.0, 30.0], [0.0, 0.0, 5.0, 10.0]]),
+    ]
+
+    features = model._temporal_memory_offline_features(
+        {}, {"gt_bboxes_3d": boxes, "gt_bboxes": camera_boxes})
+
+    declared = {
+        "num_annotations", "avg_object_distance_m",
+        "median_object_distance_m", "min_object_distance_m",
+        "p10_object_distance_m", "p90_object_distance_m",
+        "near_object_count_10m", "near_object_count_20m",
+        "near_object_count_30m", "near_object_count_50m",
+        "avg_box_length_m", "avg_box_width_m", "avg_box_height_m",
+        "avg_box_volume_m3", "avg_box_area_m2",
+        "avg_object_speed_mps", "max_object_speed_mps",
+        "camera_annotation_count", "max_camera_annotation_count",
+        "min_camera_annotation_count", "avg_camera_annotation_count",
+        "avg_2d_box_area_px", "max_2d_box_area_px",
+        "new_object_proxy_count", "matched_object_proxy_count",
+        "disappeared_object_proxy_count", "new_object_proxy_fraction",
+    }
+    assert declared <= features.keys()
+    assert features["num_annotations"] == 2.0
+    assert features["avg_object_distance_m"] == 7.5
+    assert features["max_object_speed_mps"] == 5.0
+    assert features["camera_annotation_count"] == 3.0
+    assert features["max_2d_box_area_px"] == 600.0
+
+
+def test_streampetr_prediction_features_threshold_scores_before_statistics():
+    model = make_fake_petr3d(temporal_memory=dict(enabled=True))
+    model.temporal_memory["policy_prediction_score_thr"] = 0.5
+    boxes = torch.tensor([
+        [0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 0.0, 3.0, 4.0],
+        [0.0, 0.0, 0.0, 9.0, 9.0, 9.0, 0.0, 30.0, 40.0],
+    ])
+
+    features = model._temporal_memory_prediction_features(dict(
+        boxes_3d=boxes,
+        scores_3d=torch.tensor([0.9, 0.1]),
+    ))
+
+    assert features["num_annotations"] == 1.0
+    assert features["max_object_speed_mps"] == 5.0
+    assert features["avg_box_length_m"] == 1.0
+
+
+def test_streampetr_parameter_anchor_connects_every_trainable_tm_module():
+    from projects.mmdet3d_plugin.models.detectors.petr3d import Petr3D
+
+    model = Petr3D.__new__(Petr3D)
+    torch.nn.Module.__init__(model)
+    model.temporal_memory_projector = torch.nn.Linear(2, 2)
+    model.temporal_memory_updater = torch.nn.Linear(2, 2)
+    model.temporal_memory_policy = torch.nn.Linear(2, 2)
+
+    loss = model._temporal_memory_parameter_anchor_loss()
+    loss.backward()
+
+    assert loss.item() == 0.0
+    for module in (
+        model.temporal_memory_projector,
+        model.temporal_memory_updater,
+        model.temporal_memory_policy,
+    ):
+        assert all(param.grad is not None for param in module.parameters())
+
+
+def test_streampetr_policy_supervision_schedule_bounds_teacher_calls():
+    model = make_fake_petr3d(temporal_memory=dict(
+        enabled=True, updater="reuse", keyframe_interval=99))
+    model.temporal_memory["policy_supervision"] = dict(
+        enabled=True, target="similarity", warmup_ratio=0.1,
+        max_train_steps=100)
+    state = model.temporal_memory_controller.states.setdefault(
+        ("scene-a", 0), dict(
+            scene_token="scene-a", frame_index=1, frames_since_full=0,
+            memory=_frame(101.0)))
+    model.train(True)
+    model._tm_train_step = 10
+    model._extract_img_feat_temporal_memory(
+        _frame(2.0), _metas(), training=True)
+    assert model.full_calls == 0
+    model._tm_train_step = 9
+    model._extract_img_feat_temporal_memory(
+        _frame(3.0), _metas(), training=True)
+    assert model.full_calls == 1
+    model.train(False)
+    model._extract_img_feat_temporal_memory(
+        _frame(4.0), _metas(), training=False)
+    assert model.full_calls == 1
+
+
+def test_streampetr_policy_class_weights_change_normalized_aggregate():
+    model = make_fake_petr3d(temporal_memory=dict(enabled=True))
+    losses = [torch.tensor(2.0), torch.tensor(4.0)]
+
+    weighted = model._temporal_memory_aggregate_policy_losses(
+        [(losses[0], 1.0), (losses[1], 3.0)])
+
+    assert weighted.item() == pytest.approx(3.5)
 
 
 def test_streampetr_adaptive_motion_reset_forces_full_per_sample():
