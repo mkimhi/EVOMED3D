@@ -203,26 +203,19 @@ class Petr3D(MVXTwoStageDetector):
             teacher_features=None):
         """Route one StreamPETR frame through dense pre-PE temporal memory."""
         if not self.temporal_memory_enabled:
-            return self.extract_img_feat(img, 1, training_mode=training), {}
+            features = self.extract_img_feat(
+                img, 1, training_mode=training)
+            if features.dim() == 6 and features.size(1) == 1:
+                features = features[:, 0]
+            return features, {}
 
-        batch = {'img': img}
         batch_size = img.size(0)
         if len(img_metas) != batch_size:
             raise ValueError(
                 'StreamPETR temporal routing requires one metadata dict per sample.')
 
-        full_batch = []
-
-        def extract_full_batch():
-            if not full_batch:
-                full_batch.append(
-                    self.temporal_memory_adapter.extract_full_features(
-                        self, batch))
-            return full_batch[0]
-
-        requests = []
+        routes = []
         actions = []
-        partial_batches = {}
         for batch_index, img_meta in enumerate(img_metas):
             scene_token = img_meta.get('scene_token')
             sample_key = self._temporal_memory_sample_key(
@@ -233,32 +226,84 @@ class Petr3D(MVXTwoStageDetector):
             action = self._temporal_memory_sample_action(
                 sample_key, scene_token, sample_prev_exists)
             actions.append(action)
-            request = dict(
+            routes.append(dict(
+                batch_index=batch_index,
                 sample_key=sample_key,
                 scene_token=scene_token,
                 prev_exists=sample_prev_exists,
                 action=action,
-                extract_full=lambda index=batch_index: extract_full_batch()[
-                    index:index + 1],
+            ))
+
+        def select_batch(indices):
+            index = torch.as_tensor(
+                indices, dtype=torch.long, device=img.device)
+            return {'img': img.index_select(0, index)}
+
+        full_indices = [
+            route['batch_index'] for route in routes
+            if route['action'] == 'L24'
+        ]
+        full_positions = {
+            batch_index: position
+            for position, batch_index in enumerate(full_indices)
+        }
+        full_group = []
+
+        def extract_full_group():
+            if not full_group:
+                full_group.append(
+                    self.temporal_memory_adapter.extract_full_features(
+                        self, select_batch(full_indices)))
+            return full_group[0]
+
+        partial_groups = {}
+        partial_positions = {}
+        for route in routes:
+            if route['action'] == 'L24':
+                continue
+            layer_id = self._temporal_memory_layer_for_action(
+                route['action'],
+                self.temporal_memory.get('partial_layer', 'block12'))
+            partial_groups.setdefault(layer_id, []).append(
+                route['batch_index'])
+        for layer_id, indices in list(partial_groups.items()):
+            partial_positions[layer_id] = {
+                batch_index: position
+                for position, batch_index in enumerate(indices)
+            }
+            partial_groups[layer_id] = (
+                self.temporal_memory_adapter.
+                extract_projected_partial_features(
+                    self, select_batch(indices), layer_id))
+
+        requests = []
+        for route in routes:
+            batch_index = route['batch_index']
+            request = dict(
+                sample_key=route['sample_key'],
+                scene_token=route['scene_token'],
+                prev_exists=route['prev_exists'],
+                action=route['action'],
             )
-            if action != 'L24':
+            if route['action'] == 'L24':
+                position = full_positions[batch_index]
+                request['extract_full'] = (
+                    lambda index=position: extract_full_group()[
+                        index:index + 1])
+            else:
                 layer_id = self._temporal_memory_layer_for_action(
-                    action,
+                    route['action'],
                     self.temporal_memory.get('partial_layer', 'block12'))
-                if layer_id not in partial_batches:
-                    partial_batches[layer_id] = (
-                        self.temporal_memory_adapter.
-                        extract_projected_partial_features(
-                            self, batch, layer_id))
-                request['partial_current'] = partial_batches[layer_id][
-                    batch_index:batch_index + 1]
+                position = partial_positions[layer_id][batch_index]
+                request['partial_current'] = partial_groups[layer_id][
+                    position:position + 1]
             requests.append(request)
 
         if (
             not training
             and teacher_features is not None
             and any(action != 'L24' for action in actions)
-            and self.tm_assert_no_teacher_in_inference
+            and self.temporal_memory_controller.inference_teacher_forbidden
         ):
             raise AssertionError(
                 'Full-feature teacher is forbidden on non-keyframe inference.')
@@ -272,17 +317,26 @@ class Petr3D(MVXTwoStageDetector):
             and self.temporal_memory_controller.train_with_teacher
             and any(action != 'L24' for action in actions)
         ):
+            teacher_indices = [
+                index for index, action in enumerate(actions)
+                if action != 'L24'
+            ]
             if teacher_features is None:
                 with torch.no_grad():
                     teacher_features = (
                         self.temporal_memory_adapter.extract_full_features(
-                            self, batch))
+                            self, select_batch(teacher_indices)))
+            else:
+                index = torch.as_tensor(
+                    teacher_indices, dtype=torch.long,
+                    device=teacher_features.device)
+                teacher_features = teacher_features.index_select(0, index)
             teacher_features = teacher_features.detach()
             distill_losses = [
                 self.temporal_memory_controller.distillation_loss(
-                    outputs[index], teacher_features[index:index + 1])
-                for index, action in enumerate(actions)
-                if action != 'L24'
+                    outputs[batch_index],
+                    teacher_features[position:position + 1])
+                for position, batch_index in enumerate(teacher_indices)
             ]
             losses['loss_tm_distill'] = (
                 sum(distill_losses) / len(distill_losses))
@@ -542,8 +596,9 @@ class Petr3D(MVXTwoStageDetector):
                             training=True,
                             prev_exists=frame_prev_exists))
                 frame_features.append(features)
-                if 'loss_tm_distill' in frame_tm_losses:
-                    tm_losses.append(frame_tm_losses['loss_tm_distill'])
+                tm_loss = frame_tm_losses.get('loss_tm_distill')
+                if tm_loss is not None and tm_loss.requires_grad:
+                    tm_losses.append(tm_loss)
             data['img_feats'] = torch.stack(frame_features, dim=1)
         else:
             prev_img = data['img'][:, :-self.num_frame_backbone_grads]

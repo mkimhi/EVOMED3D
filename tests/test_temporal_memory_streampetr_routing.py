@@ -24,17 +24,22 @@ def make_fake_petr3d(temporal_memory):
     model.tm_assert_no_teacher_in_inference = True
     model.full_calls = 0
     model.full_grad_enabled = []
+    model.full_batch_values = []
     model.intermediate_layers = []
+    model.intermediate_batch_values = []
 
     def extract_img_feat(self, img, len_queue=1, training_mode=False):
         assert len_queue == 1
         self.full_calls += 1
         self.full_grad_enabled.append(torch.is_grad_enabled())
+        self.full_batch_values.append(img[:, 0, 0, 0, 0].tolist())
         return img + 100.0
 
     def extract_img_feat_intermediate(self, img, layer_id, len_queue=1):
         assert len_queue == 1
         self.intermediate_layers.append(layer_id)
+        self.intermediate_batch_values.append(
+            img[:, 0, 0, 0, 0].tolist())
         return img + float(layer_id)
 
     model.extract_img_feat = MethodType(extract_img_feat, model)
@@ -104,6 +109,38 @@ def test_streampetr_non_keyframe_uses_l12_and_never_calls_teacher_inference():
     assert model.full_calls == 1
 
 
+def test_streampetr_mixed_batch_extracts_only_each_routed_sample_subset():
+    model = make_fake_petr3d(temporal_memory=dict(
+        enabled=True,
+        keyframe_interval=4,
+        partial_layer="block12",
+        updater="partial_only",
+    ))
+    metas = [
+        {"scene_token": "scene-a", "sample_idx": "a"},
+        {"scene_token": "scene-b", "sample_idx": "b"},
+    ]
+    model._extract_img_feat_temporal_memory(
+        torch.tensor([1.0, 2.0]).reshape(2, 1, 1, 1, 1),
+        metas,
+        training=False,
+    )
+    model.temporal_memory_controller.states[("scene-a", 0)]["frame_index"] = 4
+    model.temporal_memory_controller.states[("scene-b", 1)]["frame_index"] = 1
+    model.full_batch_values.clear()
+    model.intermediate_batch_values.clear()
+
+    features, _ = model._extract_img_feat_temporal_memory(
+        torch.tensor([10.0, 20.0]).reshape(2, 1, 1, 1, 1),
+        metas,
+        training=False,
+    )
+
+    assert model.full_batch_values == [[10.0]]
+    assert model.intermediate_batch_values == [[20.0]]
+    assert features.reshape(-1).tolist() == [110.0, 32.0]
+
+
 def test_streampetr_scene_boundary_forces_a_new_full_feature():
     model = make_fake_petr3d(temporal_memory=dict(
         enabled=True,
@@ -136,6 +173,28 @@ def test_streampetr_disabled_preserves_direct_full_path():
     assert losses == {}
     assert model.temporal_memory_controller is None
     assert model.temporal_memory_adapter is None
+
+
+def test_streampetr_disabled_training_helper_normalizes_queue_axis_to_5d():
+    from projects.mmdet3d_plugin.models.detectors.petr3d import Petr3D
+
+    model = Petr3D.__new__(Petr3D)
+    torch.nn.Module.__init__(model)
+    model.temporal_memory_enabled = False
+
+    def extract_img_feat(self, img, len_queue=1, training_mode=False):
+        assert training_mode is True
+        return img.unsqueeze(1)
+
+    model.extract_img_feat = MethodType(extract_img_feat, model)
+    img = _frame(7.0)
+
+    features, losses = model._extract_img_feat_temporal_memory(
+        img, _metas(), training=True)
+
+    assert features.shape == img.shape
+    assert torch.equal(features, img)
+    assert losses == {}
 
 
 def test_streampetr_training_non_keyframe_distills_from_stop_gradient_teacher():
@@ -191,6 +250,28 @@ def test_streampetr_inference_rejects_a_supplied_non_keyframe_teacher():
         )
 
 
+def test_streampetr_inference_teacher_guard_uses_resolved_controller_config():
+    model = make_fake_petr3d(temporal_memory=dict(
+        enabled=True,
+        keyframe_interval=4,
+        partial_layer="block12",
+    ))
+    model.tm_assert_no_teacher_in_inference = True
+    model.temporal_memory_controller.inference_teacher_forbidden = False
+    model._extract_img_feat_temporal_memory(
+        _frame(1.0), _metas(sample="sample-0"), training=False)
+
+    features, losses = model._extract_img_feat_temporal_memory(
+        _frame(2.0),
+        _metas(sample="sample-1"),
+        training=False,
+        teacher_features=_frame(102.0),
+    )
+
+    assert features.shape == _frame().shape
+    assert losses == {}
+
+
 def test_streampetr_forward_train_uses_one_router_and_collects_distillation():
     from projects.mmdet3d_plugin.models.detectors.petr3d import Petr3D
 
@@ -207,7 +288,8 @@ def test_streampetr_forward_train_uses_one_router_and_collects_distillation():
     def route(self, img, img_metas, training=False, prev_exists=None):
         routed.append((img.clone(), img_metas, training, prev_exists.clone()))
         frame = len(routed)
-        losses = {"loss_tm_distill": img.new_tensor(float(frame))}
+        losses = {"loss_tm_distill": img.new_tensor(
+            float(frame), requires_grad=torch.is_grad_enabled())}
         return img[:, :, :1, :1, :1] + frame, losses
 
     def history(self, *args, **data):
@@ -235,7 +317,8 @@ def test_streampetr_forward_train_uses_one_router_and_collects_distillation():
     assert all(call[2] is True for call in routed)
     assert [call[3].item() for call in routed] == [0.0, 1.0]
     assert seen_features[0].shape == (1, 2, 2, 1, 1, 1)
-    assert losses["loss_tm_distill"].item() == pytest.approx(1.5)
+    assert losses["loss_tm_distill"].requires_grad
+    assert losses["loss_tm_distill"].item() == pytest.approx(2.0)
 
 
 def test_streampetr_simple_test_routes_features_before_unchanged_head_path():
