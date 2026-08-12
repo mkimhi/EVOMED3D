@@ -149,3 +149,24 @@ def test_dense_model_cannot_force_partial_action():
     )
     with pytest.raises(ValueError, match='cannot force an action'):
         validate_profile_model(model, requested_action='L8')
+
+
+def test_highres_profile_summary_contains_peak_memory_and_component_times():
+    from tools.profile_streampetr_highres import build_summary
+
+    summary = build_summary(
+        resolution=(640, 1600),
+        peak_allocated=40,
+        peak_reserved=48,
+        backbone_s=0.10,
+        head_s=0.02,
+        total_s=0.13,
+    )
+    assert summary == {
+        'resolution': [640, 1600],
+        'peak_allocated_bytes': 40,
+        'peak_reserved_bytes': 48,
+        'backbone_ms': 100.0,
+        'head_ms': 20.0,
+        'total_ms': 130.0,
+    }
