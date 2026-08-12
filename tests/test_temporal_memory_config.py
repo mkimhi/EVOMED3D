@@ -1,6 +1,7 @@
 import ast
 from pathlib import Path
 
+import pytest
 from mmcv import Config
 
 
@@ -19,6 +20,12 @@ def _class_init_args(path, class_name):
                 if isinstance(item, ast.FunctionDef) and item.name == "__init__":
                     return [arg.arg for arg in item.args.args], item
     raise AssertionError(f"{class_name}.__init__ not found in {path}")
+
+
+def load_config_namespace(path):
+    namespace = {}
+    exec(compile(path.read_text(), str(path), "exec"), namespace)
+    return namespace
 
 
 def test_repdetr3d_and_streampetr_accept_disabled_temporal_memory_config():
@@ -256,3 +263,141 @@ def test_streampetr_eva02_highres_teacher_config_is_camera_only_and_checkpoint_s
     assert loaded.train_pipeline[4]["data_aug_conf"]["final_dim"] == (640, 1600)
     assert loaded.test_pipeline[1]["data_aug_conf"]["final_dim"] == (640, 1600)
     assert loaded.evaluation["pipeline"][1]["data_aug_conf"]["final_dim"] == (640, 1600)
+
+
+@pytest.mark.parametrize('filename, expected', [
+    (
+        'stream_petr_eva02_flash_1600_bs1_seq_24e_tm_baseline.py',
+        dict(enabled=False, detector_adapter='streampetr'),
+    ),
+    (
+        'stream_petr_eva02_flash_1600_bs1_seq_24e_tm_reuse_k3.py',
+        dict(
+            enabled=True,
+            detector_adapter='streampetr',
+            updater='reuse',
+            keyframe_interval=3,
+            train_queue_length=3,
+        ),
+    ),
+    (
+        'stream_petr_eva02_flash_1600_bs1_seq_24e_tm_gated_l12_k4_distill.py',
+        dict(
+            enabled=True,
+            detector_adapter='streampetr',
+            updater='gated_residual',
+            partial_layer='block12',
+            keyframe_interval=4,
+            max_frames_between_full=4,
+            memory_is_pre_pe=True,
+            pe_mode='separate_recompute',
+            train_with_teacher=True,
+            use_distillation=True,
+            train_queue_length=4,
+        ),
+    ),
+    (
+        'stream_petr_eva02_flash_1600_bs1_seq_24e_tm_mlp_policy_reset4_similarity_online_offline_teacher_forcing_motion_reset_feature_noise_no_distill.py',
+        dict(
+            enabled=True,
+            detector_adapter='streampetr',
+            updater='gated_residual',
+            partial_layers=(8, 12, 16),
+            max_frames_between_full=4,
+            use_distillation=False,
+            train_queue_length=4,
+        ),
+    ),
+])
+def test_streampetr_highres_temporal_configs(filename, expected):
+    path = ROOT / 'projects/configs/StreamPETR' / filename
+    namespace = load_config_namespace(path)
+    tm = namespace['model']['temporal_memory']
+    for key, value in expected.items():
+        if key == 'train_queue_length':
+            assert namespace['data']['train']['queue_length'] == value
+        else:
+            assert tm[key] == value
+
+    loaded = Config.fromfile(str(path))
+    assert loaded.input_modality.use_camera is True
+    assert loaded.input_modality.use_lidar is False
+    assert loaded.input_modality.use_radar is False
+    for split in ('train', 'val', 'test'):
+        assert loaded.data[split].modality.use_camera is True
+        assert loaded.data[split].modality.use_lidar is False
+        assert loaded.data[split].modality.use_radar is False
+
+
+def test_streampetr_highres_temporal_policy_marks_oracle_training_features():
+    filename = (
+        'stream_petr_eva02_flash_1600_bs1_seq_24e_'
+        'tm_mlp_policy_reset4_similarity_online_offline_teacher_forcing_'
+        'motion_reset_feature_noise_no_distill.py'
+    )
+    namespace = load_config_namespace(
+        ROOT / 'projects/configs/StreamPETR' / filename)
+    tm = namespace['model']['temporal_memory']
+    policy = tm['policy']
+    semantics = tm['policy_feature_semantics']
+
+    assert policy['actions'] == dict(
+        easy='L8', medium='L12', hard='L16', very_hard='L24')
+    assert policy['feature_names'] == (
+        semantics['online_deployable_features']
+        + semantics['offline_training_only_oracle_features'])
+    assert 'ego_speed_mps' in semantics['online_deployable_features']
+    assert 'max_object_speed_mps' in semantics[
+        'offline_training_only_oracle_features']
+    assert semantics['training_offline_source'] == 'previous_ground_truth_teacher_forcing'
+    assert semantics['validation_inference_offline_source'] == 'previous_predictions_only'
+    assert tm['policy_offline_features'] == 'teacher_forcing'
+    assert tm['adaptive_reset'] == dict(
+        enabled=True,
+        max_frames_between_full=2,
+        ego_speed_mps=2.0,
+        max_object_speed_mps=5.0,
+    )
+    assert tm['policy_supervision']['target'] == 'similarity'
+    assert tm['policy_supervision']['feature_noise_std'] == 0.10
+
+
+def test_streampetr_highres_temporal_configs_have_unique_handoff_metadata():
+    config_dir = ROOT / 'projects/configs/StreamPETR'
+    filenames = [
+        'stream_petr_eva02_flash_1600_bs1_seq_24e_tm_baseline.py',
+        'stream_petr_eva02_flash_1600_bs1_seq_24e_tm_reuse_k3.py',
+        'stream_petr_eva02_flash_1600_bs1_seq_24e_tm_gated_l12_k4_distill.py',
+        (
+            'stream_petr_eva02_flash_1600_bs1_seq_24e_'
+            'tm_mlp_policy_reset4_similarity_online_offline_teacher_forcing_'
+            'motion_reset_feature_noise_no_distill.py'
+        ),
+    ]
+    namespaces = {
+        filename: load_config_namespace(config_dir / filename)
+        for filename in filenames
+    }
+    work_dirs = [namespace['work_dir'] for namespace in namespaces.values()]
+    assert len(work_dirs) == len(set(work_dirs))
+    for filename, namespace in namespaces.items():
+        assert Path(namespace['work_dir']).name == Path(filename).stem
+
+    teacher_checkpoint = (
+        './work_dirs/stream_petr_eva02_flash_1600_bs1_seq_24e/latest.pth')
+    assert 'load_from' not in namespaces[filenames[0]]
+    assert 'load_from' not in namespaces[filenames[1]]
+    assert namespaces[filenames[2]]['load_from'] == teacher_checkpoint
+    assert namespaces[filenames[3]]['load_from'] == teacher_checkpoint
+    assert all(
+        namespace.get('load_from')
+        != './ckpts/repdetr3d_eva02_800_bs4_seq_24e.pth'
+        for namespace in namespaces.values())
+
+    results = (ROOT / 'RESULTS.md').read_text()
+    for filename, namespace in namespaces.items():
+        assert results.count(filename) == 1
+        work_dir = namespace['work_dir']
+        if work_dir.startswith('./'):
+            work_dir = work_dir[2:]
+        assert work_dir in results
