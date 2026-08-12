@@ -1,13 +1,9 @@
 from ..detector_adapters import DetectorAdapter
+from ..partial_features import resolve_eva_layer_index
 
 
 class StreamPETRAdapter(DetectorAdapter):
-    """StreamPETR adapter placeholder for dense temporal memory.
-
-    TODO: Implement feature extraction in
-    projects/mmdet3d_plugin/models/detectors/petr3d.py::Petr3D.extract_img_feat
-    once the StreamPETR dense feature level is confirmed for each supported
-    backbone/config.
+    """Adapter for StreamPETR's dense, pre-position-encoding image feature.
 
     TODO: Implement PE recomputation around
     projects/mmdet3d_plugin/models/dense_heads/streampetr_head.py::StreamPETRHead.position_embeding
@@ -25,11 +21,6 @@ class StreamPETRAdapter(DetectorAdapter):
     pe_mode = 'separate_recompute'
     pe_source = 'streampetr_head_position_embeding'
 
-    _FEATURE_TODO = (
-        'StreamPETR dense feature extraction is not wired yet. TODO: verify '
-        'projects/mmdet3d_plugin/models/detectors/petr3d.py::Petr3D.extract_img_feat '
-        'and the config-specific position_level before enabling this adapter.'
-    )
     _PE_TODO = (
         'StreamPETR PE recomputation is not wired yet. TODO: refactor or wrap '
         'projects/mmdet3d_plugin/models/dense_heads/streampetr_head.py::'
@@ -44,10 +35,17 @@ class StreamPETRAdapter(DetectorAdapter):
     )
 
     def extract_full_features(self, model, batch, **kwargs):
-        raise NotImplementedError(self._FEATURE_TODO)
+        features = model.extract_img_feat(
+            batch['img'], len_queue=1, training_mode=model.training)
+        if hasattr(features, 'dim') and features.dim() == 6 and features.size(1) == 1:
+            features = features[:, 0]
+        return self._validate_spatial_feature(features)
 
-    def extract_partial_features(self, model, batch, layer_id, **kwargs):
-        raise NotImplementedError(self._FEATURE_TODO)
+    def extract_partial_features(self, model, batch, layer_id, depth=24, **kwargs):
+        layer_index = resolve_eva_layer_index(layer_id, depth=depth)
+        features = model.extract_img_feat_intermediate(
+            batch['img'], layer_index, len_queue=1)
+        return self._validate_spatial_feature(features)
 
     def compute_position_encoding(self, model, batch, feature_spec):
         raise NotImplementedError(self._PE_TODO)
@@ -56,7 +54,16 @@ class StreamPETRAdapter(DetectorAdapter):
         raise NotImplementedError(self._INJECT_TODO)
 
     def feature_to_memory(self, features, **kwargs):
-        raise NotImplementedError(self._FEATURE_TODO)
+        return self._validate_spatial_feature(features)
 
     def memory_to_feature(self, memory, feature_spec=None):
-        raise NotImplementedError(self._INJECT_TODO)
+        return self._validate_spatial_feature(memory)
+
+    @staticmethod
+    def _validate_spatial_feature(features):
+        if not hasattr(features, 'dim') or features.dim() != 5:
+            shape = getattr(features, 'shape', None)
+            raise ValueError(
+                'StreamPETR expected [B, N_cam, C, H, W] spatial features; '
+                f'got {shape}.')
+        return features

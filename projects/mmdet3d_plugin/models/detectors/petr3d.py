@@ -112,6 +112,39 @@ class Petr3D(MVXTwoStageDetector):
         self._maybe_log_tm_shapes(img_feats_reshaped)
         return img_feats_reshaped
 
+    def extract_img_feat_intermediate(self, img, layer_id, len_queue=1):
+        """Extract one EVA block feature through the detector's projection."""
+        B = img.size(0)
+        if img.dim() == 6:
+            img = img.flatten(1, 2)
+        if img.dim() == 5 and img.size(0) == 1:
+            img = img.squeeze(0)
+        elif img.dim() == 5 and img.size(0) > 1:
+            _, N, C, H, W = img.size()
+            img = img.reshape(B * N, C, H, W)
+        if self.use_grid_mask:
+            img = self.grid_mask(img)
+
+        feature = self.img_backbone.forward_intermediate(img, layer_id)
+        sim_fpn = getattr(self.img_backbone, 'adapter', None)
+        if sim_fpn is None:
+            raise ValueError('StreamPETR intermediate EVA extraction requires sim_fpn.')
+        img_feats = sim_fpn(feature)
+        if isinstance(img_feats, dict):
+            img_feats = list(img_feats.values())
+        if self.with_img_neck:
+            img_feats = self.img_neck(img_feats)
+
+        feature = img_feats[self.position_level]
+        BN, C, H, W = feature.size()
+        num_cameras = int(BN / B / len_queue)
+        if len_queue == 1:
+            feature = feature.view(B, num_cameras, C, H, W)
+        else:
+            feature = feature.view(B, len_queue, num_cameras, C, H, W)
+        self._maybe_log_tm_shapes(feature)
+        return feature
+
 
     @auto_fp16(apply_to=('img'), out_fp32=True)
     def extract_feat(self, img, T, training_mode=False):
