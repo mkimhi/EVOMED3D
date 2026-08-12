@@ -31,6 +31,25 @@ def build_summary(
     }
 
 
+def ensure_cuda_available(device, cuda_available=None):
+    if cuda_available is None:
+        cuda_available = torch.cuda.is_available()
+    if not str(device).startswith('cuda') or not cuda_available:
+        raise RuntimeError('CUDA is required for high-resolution profiling')
+
+
+def validate_consistent_resolution(expected, observed):
+    observed = [int(observed[0]), int(observed[1])]
+    if expected is None:
+        return observed
+    expected = [int(expected[0]), int(expected[1])]
+    if observed != expected:
+        raise ValueError(
+            'expected all profiled samples to share resolution: '
+            f'first={expected}, observed={observed}')
+    return expected
+
+
 def parse_args(argv=None):
     from mmcv import DictAction
 
@@ -102,8 +121,7 @@ def main(argv=None):
     args = parse_args(argv)
     if args.num_samples < 1:
         raise ValueError('--num-samples must be positive')
-    if not args.device.startswith('cuda') or not torch.cuda.is_available():
-        raise RuntimeError('CUDA is required for high-resolution profiling')
+    ensure_cuda_available(args.device)
 
     config_path = Path(args.config)
     checkpoint_path = Path(args.checkpoint)
@@ -152,6 +170,7 @@ def main(argv=None):
 
     device_index = int(args.device.split(':', 1)[1]) if ':' in args.device else 0
     summaries = []
+    expected_resolution = None
     with torch.no_grad():
         for index, data in enumerate(data_loader):
             _, scattered_kwargs = scatter_kwargs((), data, [device_index], dim=0)
@@ -162,6 +181,8 @@ def main(argv=None):
             img = image_list[0]
             img_metas, frame_data = _prepare_test_frame(model_kwargs)
             summary = _profile_frame(model, img, img_metas, frame_data)
+            expected_resolution = validate_consistent_resolution(
+                expected_resolution, summary['resolution'])
             summaries.append(summary)
             print(
                 f'[{index + 1}/{len(dataset)}] '

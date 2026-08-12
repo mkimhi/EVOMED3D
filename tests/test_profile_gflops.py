@@ -170,3 +170,21 @@ def test_highres_profile_summary_contains_peak_memory_and_component_times():
         'head_ms': 20.0,
         'total_ms': 130.0,
     }
+
+
+def test_highres_profile_requires_cuda():
+    from tools.profile_streampetr_highres import ensure_cuda_available
+
+    with pytest.raises(
+        RuntimeError, match='CUDA is required for high-resolution profiling'):
+        ensure_cuda_available('cpu', cuda_available=False)
+
+
+def test_highres_profile_rejects_mixed_resolutions():
+    from tools.profile_streampetr_highres import validate_consistent_resolution
+
+    assert validate_consistent_resolution(None, [640, 1600]) == [640, 1600]
+    assert validate_consistent_resolution([640, 1600], [640, 1600]) == [640, 1600]
+    with pytest.raises(
+        ValueError, match='expected all profiled samples to share resolution'):
+        validate_consistent_resolution([640, 1600], [704, 1600])
