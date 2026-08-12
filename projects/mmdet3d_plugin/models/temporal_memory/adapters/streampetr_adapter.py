@@ -47,6 +47,16 @@ class StreamPETRAdapter(DetectorAdapter):
             batch['img'], layer_index, len_queue=1)
         return self._validate_spatial_feature(features)
 
+    def extract_projected_partial_features(
+            self, model, batch, layer_id, depth=24, **kwargs):
+        """Return an intermediate feature at the detector's pre-PE boundary.
+
+        ``Petr3D.extract_img_feat_intermediate`` applies EVA's existing
+        ``sim_fpn`` projection, so no second projector should be applied here.
+        """
+        return self.extract_partial_features(
+            model, batch, layer_id, depth=depth, **kwargs)
+
     def compute_position_encoding(self, model, batch, feature_spec):
         raise NotImplementedError(self._PE_TODO)
 
