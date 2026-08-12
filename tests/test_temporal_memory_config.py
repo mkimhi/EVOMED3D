@@ -239,12 +239,18 @@ def test_streampetr_eva02_highres_teacher_config_is_camera_only_and_checkpoint_s
     assert namespace["num_gpus"] == 4
     assert namespace["batch_size"] == 1
     assert namespace["num_epochs"] == 24
+    assert namespace["num_iters_per_epoch"] == 28130 // 4
     assert namespace["ida_aug_conf"]["final_dim"] == (640, 1600)
     assert namespace["input_modality"]["use_camera"] is True
     assert namespace["input_modality"]["use_lidar"] is False
     assert namespace["input_modality"]["use_radar"] is False
     assert namespace["load_from"] == "./ckpts/eva02_L_coco_det_sys_o365_remapped.pth"
+    assert namespace["checkpoint_config"]["interval"] == namespace["num_iters_per_epoch"]
     assert namespace["checkpoint_config"]["max_keep_ckpts"] == 2
+    assert namespace["runner"]["max_iters"] == (
+        namespace["num_epochs"] * namespace["num_iters_per_epoch"])
+    assert [hook["type"] for hook in namespace["log_config"]["hooks"]] == [
+        "TextLoggerHook", "TensorboardLoggerHook"]
 
     loaded = Config.fromfile(str(config))
     assert loaded.train_pipeline[4]["data_aug_conf"]["final_dim"] == (640, 1600)

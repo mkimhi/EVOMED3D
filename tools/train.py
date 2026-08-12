@@ -10,12 +10,17 @@ import argparse
 import copy
 import mmcv
 import os
+import sys
 import time
 import torch
 import warnings
 from mmcv import Config, DictAction
 from mmcv.runner import get_dist_info, init_dist, wrap_fp16_model
 from os import path as osp
+
+REPO_ROOT = osp.dirname(osp.dirname(osp.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 from mmdet import __version__ as mmdet_version
 from mmdet3d import __version__ as mmdet3d_version

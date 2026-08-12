@@ -130,6 +130,13 @@ evaluation = dict(interval=num_iters_per_epoch * num_epochs, pipeline=test_pipel
 
 checkpoint_config = dict(interval=num_iters_per_epoch, max_keep_ckpts=2)
 
+log_config = dict(
+    interval=50,
+    hooks=[
+        dict(type='TextLoggerHook'),
+        dict(type='TensorboardLoggerHook'),
+    ])
+
 runner = dict(type='IterBasedRunner', max_iters=num_epochs * num_iters_per_epoch)
 
 load_from = './ckpts/eva02_L_coco_det_sys_o365_remapped.pth'

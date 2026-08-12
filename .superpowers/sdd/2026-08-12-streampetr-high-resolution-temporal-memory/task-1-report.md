@@ -97,3 +97,110 @@ eval_final_dim (640, 1600)
 ## Concerns
 
 1. Final verification in this completion was limited to the requested static config test, Python compilation, and config parsing; it does not re-verify checkpoint-load/runtime behavior.
+
+---
+
+## Fix round 1
+
+### Status
+
+DONE_WITH_CONCERNS
+
+### Review items addressed
+
+1. Ran the exact brief smoke command and fixed its root causes so it now completes from the shared checkout without extra environment variables.
+2. Extended the static high-resolution config test to assert:
+   - `num_iters_per_epoch == 28130 // 4`
+   - `runner.max_iters == num_epochs * num_iters_per_epoch`
+   - `checkpoint_config.interval == num_iters_per_epoch`
+3. Added a regression check that the high-resolution config does not inherit `WandbLoggerHook`, because that was the remaining non-interactive smoke blocker after fixing launcher imports.
+
+### Root-cause findings
+
+1. `python tools/train.py ...` failed with `ModuleNotFoundError: No module named 'projects'` because running the script from `tools/` did not put the repository root on `sys.path`, so plugin import resolution via `projects.mmdet3d_plugin` failed.
+2. After fixing that launcher issue, the exact smoke command still failed in `WandbLoggerHook` with `No API key configured` because the new high-resolution config inherited the base EVA W&B logger hooks unchanged.
+
+### Fixes
+
+- Updated `tools/train.py` to insert the repository root into `sys.path` before plugin imports.
+- Updated `projects/configs/StreamPETR/stream_petr_eva02_flash_1600_bs1_seq_24e.py` to override `log_config` with only `TextLoggerHook` and `TensorboardLoggerHook`.
+- Extended `tests/test_temporal_memory_config.py` with the requested iteration/checkpoint assertions and the non-W&B logger regression check.
+
+### Commands run
+
+#### Red: exact brief smoke command before fixes
+
+```bash
+python tools/train.py projects/configs/StreamPETR/stream_petr_eva02_flash_1600_bs1_seq_24e.py --cfg-options runner.max_iters=1 data.workers_per_gpu=0 --work-dir work_dirs/tm_streampetr_1600_config_smoke
+```
+
+Output before launcher fix:
+
+```text
+ModuleNotFoundError: No module named 'projects'
+```
+
+Output after launcher fix but before config logging fix:
+
+```text
+wandb.errors.errors.UsageError: No API key configured. Use `wandb login` to log in.
+```
+
+#### Red: extended static test before config logging fix
+
+```bash
+TMPDIR=/tmp pytest -q tests/test_temporal_memory_config.py -k highres_teacher
+```
+
+Output:
+
+```text
+KeyError: 'log_config'
+```
+
+#### Green: extended static test
+
+```bash
+TMPDIR=/tmp pytest -q tests/test_temporal_memory_config.py -k highres_teacher
+```
+
+Output:
+
+```text
+.                                                                        [100%]
+1 passed, 6 deselected, 3 warnings in 2.22s
+```
+
+#### Green: exact brief smoke command after fixes
+
+```bash
+python tools/train.py projects/configs/StreamPETR/stream_petr_eva02_flash_1600_bs1_seq_24e.py --cfg-options runner.max_iters=1 data.workers_per_gpu=0 --work-dir work_dirs/tm_streampetr_1600_config_smoke
+```
+
+Key output excerpts:
+
+```text
+2026-08-12 20:50:37,722 - mmdet - INFO - Config:
+...
+final_dim=(640, 1600)
+...
+2026-08-12 20:50:59,412 - mmdet - INFO - load checkpoint from local path: ./ckpts/eva02_L_coco_det_sys_o365_remapped.pth
+2026-08-12 20:51:00,590 - mmdet - WARNING - The model and loaded state dict do not match exactly
+size mismatch for img_backbone.rope_glb.freqs_cos: copying a param with shape torch.Size([9216, 64]) from checkpoint, the shape in current model is torch.Size([400, 64]).
+size mismatch for img_backbone.rope_glb.freqs_sin: copying a param with shape torch.Size([9216, 64]) from checkpoint, the shape in current model is torch.Size([400, 64]).
+2026-08-12 20:51:00,592 - mmdet - INFO - workflow: [('train', 1)], max: 1 iters
+2026-08-12 20:51:07,093 - mmdet - INFO - Saving checkpoint at 1 iterations
+```
+
+Exit code: `0`
+
+### Files changed in fix round 1
+
+- `tools/train.py`
+- `projects/configs/StreamPETR/stream_petr_eva02_flash_1600_bs1_seq_24e.py`
+- `tests/test_temporal_memory_config.py`
+- `.superpowers/sdd/2026-08-12-streampetr-high-resolution-temporal-memory/task-1-report.md`
+
+### Concerns
+
+1. The exact brief smoke command now completes, but EVA checkpoint loading still reports the expected/non-fatal rotary-position mismatch warnings at 640×1600 (`rope_glb.freqs_cos/sin` shape `9216 -> 400`), so startup is checkpoint-compatible rather than warning-free.
