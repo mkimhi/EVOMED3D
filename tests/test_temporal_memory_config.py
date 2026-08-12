@@ -1,6 +1,8 @@
 import ast
 from pathlib import Path
 
+from mmcv import Config
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -227,3 +229,24 @@ def test_mod_configs_use_global_half_capacity_and_differ_by_training_regime():
     assert configs["warmup"]["model"]["temporal_memory"]["mod_router"]["train_backbone"] is False
     assert configs["warmup"]["model"]["temporal_memory"]["mod_router"]["adapter_warmup_only"] is True
     assert configs["joint"]["model"]["temporal_memory"]["mod_router"]["train_backbone"] is True
+
+
+def test_streampetr_eva02_highres_teacher_config_is_camera_only_and_checkpoint_safe():
+    config = ROOT / "projects/configs/StreamPETR/stream_petr_eva02_flash_1600_bs1_seq_24e.py"
+    namespace = {}
+    exec(config.read_text(), namespace)
+
+    assert namespace["num_gpus"] == 4
+    assert namespace["batch_size"] == 1
+    assert namespace["num_epochs"] == 24
+    assert namespace["ida_aug_conf"]["final_dim"] == (640, 1600)
+    assert namespace["input_modality"]["use_camera"] is True
+    assert namespace["input_modality"]["use_lidar"] is False
+    assert namespace["input_modality"]["use_radar"] is False
+    assert namespace["load_from"] == "./ckpts/eva02_L_coco_det_sys_o365_remapped.pth"
+    assert namespace["checkpoint_config"]["max_keep_ckpts"] == 2
+
+    loaded = Config.fromfile(str(config))
+    assert loaded.train_pipeline[4]["data_aug_conf"]["final_dim"] == (640, 1600)
+    assert loaded.test_pipeline[1]["data_aug_conf"]["final_dim"] == (640, 1600)
+    assert loaded.evaluation["pipeline"][1]["data_aug_conf"]["final_dim"] == (640, 1600)
